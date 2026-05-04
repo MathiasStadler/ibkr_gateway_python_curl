@@ -43,6 +43,7 @@ source .venv/bin/activate
 ```bash <!-- markdownlint-disable-line code-block-style -->
 pip list
 ```
+<!-- ktf -->
 ## install packages
 <!-- ktf -->
 ```bash <!-- markdownlint-disable-line code-block-style -->

@@ -1,0 +1,6 @@
+=== Log-Datei: Gefilterte Put-Optionen (Delta -0.5 bis -0.25) ===
+Startzeit: 2026-05-04 21:44:26
+Format: Zeit | Strike | Verfall | Delta | Open Interest | Last Price
+
+
+⚠️ Keine Optionen mit dem gewünschten Delta-Bereich gefunden.

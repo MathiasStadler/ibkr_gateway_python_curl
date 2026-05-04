@@ -1,0 +1,5 @@
+=== Log-Datei: PLTR Put-Optionen (Delta -0.5 bis -0.25) ===
+Startzeit: 2026-05-04 21:22:31
+
+
+⚠️ Keine Optionen mit dem gewünschten Delta-Bereich gefunden.

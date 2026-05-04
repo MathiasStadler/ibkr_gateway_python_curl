@@ -1,4 +1,6 @@
 # ibkr_gateway use case in curl and python
+
+- try out the gateway for repeated execution of certain option strategies with python program and curl command
 <!-- ktf -->
 <!-- To comply with the format -->
 <!-- Link sign - Don't Found a better way :-( - You know a better method? - send me a email -->
