@@ -12,7 +12,7 @@ def scanner_params():
     # base_url = "https://localhost:5000/v1/api/"
     # change port for IB Gateway
     base_url = "https://localhost:4002/v1/api/"
-    endpoint = "iserver/auth/status"
+    endpoint = "GET /iserver/scanner/params"
     
     auth_req = requests.get(url=base_url+endpoint,verify=False)
     print(auth_req)
