@@ -4,6 +4,9 @@
 import requests
 import urllib3
 import csv
+import json
+
+import pprint
 
 # Ignore insecure error messages
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -12,11 +15,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 def secdefSearch(symbol, listingExchange):
     url = f'https://localhost:4002/v1/api/iserver/secdef/search?symbol={symbol}'
     search_request = requests.get(url=url, verify=False)
+    # print(search_request.json())
+    pprint.pprint(search_request.json())
+    json_formatted_str = json.dumps(search_request.json(), indent=0)
+    print(json_formatted_str)
+    
     for contract in search_request.json():
         if contract["description"] == listingExchange:
             underConid = contract["conid"]
             for secType in contract["sections"]:
-                if secType["secType"] == "OPT":
+                 if secType["secType"] == "OPT":
                     months = secType["months"].split(';')
     return underConid, months
 
