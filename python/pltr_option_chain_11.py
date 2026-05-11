@@ -14,8 +14,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 BASE_URL = "https://127.0.0.1:4002/v1/api"
 SYMBOL = "PLTR"
 MAX_RESULTS = 30
-DELTA_MIN = -0.50
-DELTA_MAX = -0.25
+DELTA_MIN = -0.00
+DELTA_MAX = -0.99
 
 # Kopfzeilen für die CSV-Ausgabe
 CSV_HEADER = [
@@ -343,6 +343,7 @@ def main():
         write_log_entry(all_log_file, strike, maturity, delta, open_interest, last_price)
 
         # Prüfen ob Delta im gewünschten Bereich liegt
+        print(f"Delta in {delta}")
         if delta is not None and DELTA_MIN <= delta <= DELTA_MAX:
             opt["delta"] = delta
             opt["open_interest"] = open_interest
