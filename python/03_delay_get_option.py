@@ -36,7 +36,7 @@ def secdefStrikes(underConid, month):
     strike_request = requests.get(url=url, verify=False)
     strikes = strike_request.json()["put"]
     for strike in strikes:
-        if strike > snapshot - 10 and strike < snapshot + 10:
+        if strike > snapshot - 100 and strike < snapshot + 100:
             itmStrikes.append(strike)
     return itmStrikes
 
@@ -126,7 +126,7 @@ def writeResult(contractDict):
 
     headers = ["conid", "symbol", "strike", "maturityDate",
                "bid", "ask", "delta", "gamma", "theta", "vega"]
-    filePath = "./MayContracts.csv"
+    filePath = "./DelayOptionContracts.csv"
     with open(filePath, 'w', newline='') as contract_csv_file:
         contract_writer = csv.DictWriter(f=contract_csv_file, fieldnames=headers)
         contract_writer.writeheader()

@@ -8,9 +8,9 @@
  touch project_path.md
 ```
 <!-- KtF-->
- ## srv form here  [![alt text][1]](https://www.interactivebrokers.com/campus/trading-lessons/launching-and-authenticating-the-gateway/)
+## srv form here  [![alt text][1]](https://www.interactivebrokers.com/campus/trading-lessons/launching-and-authenticating-the-gateway/)
 <!-- KtF-->
- ## detect os version
+## detect os version
 <!-- KtF-->
 ```bash
 cat /etc/debian_version
