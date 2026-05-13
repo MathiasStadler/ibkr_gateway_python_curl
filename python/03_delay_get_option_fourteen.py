@@ -15,8 +15,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PREFERRED_EXCHANGES = ["NASDAQ", "NYSE", "NYSE MKT", "BATS", "SMART", "AMEX"]
-FILTER_DELTA = True          # True = nur Deltas -0.50..-0.30, False = alle
-FORCE_PUT_ONLY = True        # Entfernt alle Nicht-PUTs aus der CSV
+FILTER_DELTA = True          # True = nur Deltas -0.50..-0.30
+FORCE_PUT_ONLY = True
 
 def authenticate_market_data():
     logging.info("Checking authentication...")
@@ -32,10 +32,20 @@ def authenticate_market_data():
 
 def secdefSearch(symbol):
     url = f'https://localhost:4002/v1/api/iserver/secdef/search?symbol={symbol}'
-    search_request = requests.get(url=url, verify=False)
-    data = search_request.json()
+    try:
+        search_request = requests.get(url=url, verify=False)
+        search_request.raise_for_status()
+        data = search_request.json()
+    except Exception as e:
+        raise ValueError(f"API request failed for {symbol}: {e}")
+
+    if not isinstance(data, list):
+        raise ValueError(f"Unexpected API response for {symbol}: {data}")
+
     selected_contract = None
     for contract in data:
+        if not isinstance(contract, dict):
+            continue
         desc = contract.get("description", "")
         if desc in PREFERRED_EXCHANGES:
             for secType in contract.get("sections", []):
@@ -47,6 +57,8 @@ def secdefSearch(symbol):
                 break
     if not selected_contract:
         for contract in data:
+            if not isinstance(contract, dict):
+                continue
             for secType in contract.get("sections", []):
                 if secType.get("secType") == "OPT":
                     selected_contract = contract
@@ -54,16 +66,25 @@ def secdefSearch(symbol):
                     break
             if selected_contract:
                 break
+
     if not selected_contract:
         raise ValueError(f"No option contract found for {symbol}")
-    underConid = selected_contract["conid"]
+
+    underConid = selected_contract.get("conid")
+    if not underConid:
+        raise ValueError(f"No conid for {symbol}")
+
     months = []
     for secType in selected_contract.get("sections", []):
         if secType.get("secType") == "OPT":
-            months = secType.get("months", "").split(';')
+            months_str = secType.get("months", "")
+            if months_str:
+                months = months_str.split(';')
             break
+
     if not months:
         raise ValueError(f"No option months for {symbol}")
+
     return underConid, months
 
 def secdefStrikes(underConid, month, exchange="SMART"):
@@ -166,18 +187,16 @@ def writeResult(contracts_list):
     logging.info(f"Fetching market data for {len(all_conids)} contracts...")
     snapshot_data = get_option_snapshot_bulk(all_conids)
     
-    # Update contracts with market data
     for conid, quote in snapshot_data.items():
         if conid in conid_to_contract:
             conid_to_contract[conid].update(quote)
     
-    # ===== Neu: Greeks mit korrektem Vorzeichen versehen =====
+    # Korrektur der Vorzeichen für Puts (falls API Beträge liefert)
     for conid, contract in conid_to_contract.items():
         if contract.get("right") == "P":
             if "delta" in contract and contract["delta"]:
                 try:
                     delta_val = float(contract["delta"])
-                    # Falls der Wert nur als Betrag vorliegt (0 bis 1), korrigieren wir das Vorzeichen.
                     if 0 <= delta_val <= 1:
                         contract["delta"] = -delta_val
                 except (ValueError, TypeError):
@@ -189,8 +208,6 @@ def writeResult(contracts_list):
                         contract["gamma"] = -gamma_val
                 except (ValueError, TypeError):
                     pass
-            # Hinweis: Theta und Vega ändern ihr Vorzeichen normalerweise nicht.
-    # =======================================================
     
     write_debug_log(contracts_list)
     
@@ -215,7 +232,8 @@ def writeResult(contracts_list):
                 if -0.50 <= delta <= -0.30:
                     filtered.append(c)
             except:
-                logging.info(f"Delta filter: {len(filtered)} contracts with delta -0.50..-0.30")
+                pass
+        logging.info(f"Delta filter: {len(filtered)} contracts with delta -0.50..-0.30")
         final_contracts = filtered
     else:
         final_contracts = put_contracts
