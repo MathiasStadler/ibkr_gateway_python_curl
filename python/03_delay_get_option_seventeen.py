@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PREFERRED_EXCHANGES = ["NASDAQ", "NYSE", "NYSE MKT", "BATS", "SMART", "AMEX"]
-FILTER_DELTA = True          # True = nur Deltas -0.50..-0.30, False = alle
+FILTER_DELTA = False          # True = nur Deltas -0.50..-0.30, False = alle
 FORCE_PUT_ONLY = True        # Entfernt alle Nicht-PUTs aus der CSV
 
 def authenticate_market_data():
@@ -275,8 +275,8 @@ def writeResult(contracts_list):
 
     write_debug_log(contracts_list)
 
-    logging.info("DEBUG: First 5 deltas (raw):")
-    for i, c in enumerate(contracts_list[:5]):
+    logging.info("DEBUG: First 10 deltas (raw):")
+    for i, c in enumerate(contracts_list[:10]):
         logging.info(f"  {i+1}: conid={c.get('conid')}, delta={c.get('delta')}, right={c.get('right')}")
 
     if FORCE_PUT_ONLY:
@@ -345,11 +345,17 @@ if __name__ == "__main__":
     for month in selected_months:
         logging.info(f"Processing {month}...")
         strikes = secdefStrikes(underConid, month)
+        number = 0
         for strike in strikes:
             contracts = secdefInfo(underConid, month, strike, right="P")
             for c in contracts:
                 c["month"] = month
                 all_contracts.append(c)
+                number += 1
+                # if number == 2:
+                #
+                #     break
+            # break
 
     logging.info(f"Total contracts fetched: {len(all_contracts)}")
     writeResult(all_contracts)
