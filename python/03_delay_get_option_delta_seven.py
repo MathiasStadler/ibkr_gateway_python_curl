@@ -11,7 +11,11 @@ import time
 import logging
 from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging to see what's happening
+#FOUND HERE https://www.hrekov.com/blog/python-logging-basicconfig
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s:%(lineno)d - %(message)s')
+
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PREFERRED_EXCHANGES = ["NASDAQ", "NYSE", "NYSE MKT", "BATS", "SMART", "AMEX"]
@@ -221,7 +225,8 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Search failed: {e}")
         sys.exit(1)
-    sorted_months = sorted(months)[:num_months]
+    # sorted_months = sorted(months)[:num_months]
+    sorted_months = months[0]
     all_contracts = []
     for month in sorted_months:
         logging.info(f"Processing {month}...")
@@ -231,5 +236,7 @@ if __name__ == "__main__":
             for c in contracts:
                 c["month"] = month
                 all_contracts.append(c)
+                break
+            break    
     logging.info(f"Total contracts fetched: {len(all_contracts)}")
     writeResult(all_contracts)

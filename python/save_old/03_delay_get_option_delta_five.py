@@ -11,7 +11,8 @@ import time
 import logging
 
 # Configure logging to see what's happening
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+#FOUND HERE https://www.hrekov.com/blog/python-logging-basicconfig
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s:%(lineno)d - %(message)s')
 
 # Ignore insecure error messages
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -20,7 +21,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 PREFERRED_EXCHANGES = ["NASDAQ", "NYSE", "NYSE MKT", "BATS", "SMART", "AMEX"]
 
 # Temporär: Setze auf False, um ALLE Optionen zu speichern (ohne Delta-Filter)
-FILTER_DELTA = True   # Ändere auf False, um alle Optionen zu sehen
+# org
+# FILTER_DELTA = True   # Ändere auf False, um alle Optionen zu sehen
+FILTER_DELTA = False   # Ändere auf False, um alle Optionen zu sehen
+
 
 def authenticate_market_data():
     """Initialize market data session by calling /iserver/accounts."""
@@ -289,7 +293,8 @@ if __name__ == "__main__":
         logging.error(f"No option months found for {ticker}")
         sys.exit(1)
 
-    sorted_months = sorted(months)[:num_months]
+    # sorted_months = sorted(months)[:num_months]
+    sorted_months = months
     logging.info(f"Processing months: {sorted_months}")
 
     all_contracts = []

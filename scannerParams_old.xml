@@ -10777,10 +10777,6 @@
         {
           "display_name": "Mexico (MEXI)",
           "type": "STK.NA.MEXI"
-        },
-        {
-          "display_name": "Brazil (B3)",
-          "type": "STK.NA.B3"
         }
       ]
     },
