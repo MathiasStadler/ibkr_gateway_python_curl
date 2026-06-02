@@ -6,7 +6,6 @@ import requests
 import urllib3
 import csv
 import json
-import pprint
 import time
 import logging
 from datetime import datetime
@@ -29,6 +28,45 @@ def authenticate_market_data():
     except Exception as e:
         logging.error(f"❌ Failed: {e}")
         return False
+
+def get_stock_price(conid, symbol):
+    """
+    Ruft den aktuellen Aktienkurs (Underlying) über die REST-API (Methode 1) ab.
+    Verwendet den Endpunkt /iserver/marketdata/snapshot.
+    """
+    logging.info(f"Fetching current stock price for {symbol} (conid={conid})...")
+    
+    authenticate_market_data()
+    
+    url = "https://localhost:4002/v1/api/iserver/marketdata/snapshot"
+    params = {
+        "conids": conid,
+        "fields": "31,84,86"   # 31 = last, 84 = bid, 86 = ask
+    }
+    try:
+        resp = requests.get(url, params=params, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and isinstance(data, list) and len(data) > 0:
+            item = data[0]
+            last = item.get("31", "N/A")
+            bid = item.get("84", "N/A")
+            ask = item.get("86", "N/A")
+            logging.info(f"✅ {symbol} - Last: {last}, Bid: {bid}, Ask: {ask}")
+            return {
+                "symbol": symbol,
+                "conid": conid,
+                "last": last,
+                "bid": bid,
+                "ask": ask,
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            logging.warning(f"Unexpected response structure: {data}")
+            return None
+    except Exception as e:
+        logging.error(f"Failed to fetch stock price for {symbol}: {e}")
+        return None
 
 def secdefSearch(symbol):
     url = f'https://localhost:4002/v1/api/iserver/secdef/search?symbol={symbol}'
@@ -166,8 +204,6 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
                         val = item.get(f_id)
                         if val is not None:
                             batch_data[conid][f_name] = val
-                            logging.info("f_id => (f_id)")
-                            logging.info(f" VAL => (f_id) (f_name) val =>  {val}")
                         else:
                             batch_data[conid][f_name] = ""
 
@@ -247,8 +283,24 @@ def write_debug_log(contracts_list, filename="option_debug.log"):
                 f.write(f"# Error serializing contract {contract.get('conid')}: {e}\n")
     logging.info(f"Debug log written to {filename} with {len(contracts_list)} entries.")
 
-def writeResult(contracts_list):
-    conid_to_contract = {c["conid"]: c for c in contracts_list}
+def writeResult(filtered_contracts):
+    """
+    Erwartet bereits gefilterte Kontrakte (z.B. die nächsten 15 Strikes unter dem Kurs).
+    Führt nur noch den Marktdatenabruf und das Schreiben der CSV durch.
+    """
+    if not filtered_contracts:
+        logging.warning("No contracts to process. CSV will be empty.")
+        headers = ["conid", "symbol", "right", "month", "strike", "maturityDate",
+                   "bid", "ask", "delta", "gamma", "theta", "vega",
+                   "volume", "open_interest", "historical_volatility", "implied_volatility"]
+        filePath = "./DelayOptionContracts.csv"
+        with open(filePath, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+        logging.info(f"✅ Empty CSV saved to {filePath}")
+        return
+
+    conid_to_contract = {c["conid"]: c for c in filtered_contracts}
     all_conids = list(conid_to_contract.keys())
     logging.info(f"Fetching market data for {len(all_conids)} contracts...")
     snapshot_data = get_option_snapshot_bulk(all_conids)
@@ -275,37 +327,11 @@ def writeResult(contracts_list):
                 except (ValueError, TypeError):
                     pass
 
-    write_debug_log(contracts_list)
+    write_debug_log(filtered_contracts)
 
     logging.info("DEBUG: First 10 deltas (raw):")
-    for i, c in enumerate(contracts_list[:10]):
+    for i, c in enumerate(filtered_contracts[:10]):
         logging.info(f"  {i+1}: conid={c.get('conid')}, delta={c.get('delta')}, right={c.get('right')}")
-
-    if FORCE_PUT_ONLY:
-        put_contracts = [c for c in contracts_list if c.get("right") == "P"]
-        logging.info(f"After right filter: {len(put_contracts)} out of {len(contracts_list)} are Puts")
-    else:
-        put_contracts = contracts_list
-
-    if FILTER_DELTA:
-        filtered = []
-        for c in put_contracts:
-            delta_raw = c.get("delta")
-            if delta_raw is None or delta_raw == "":
-                continue
-            try:
-                delta = float(delta_raw)
-                if -0.50 <= delta <= -0.30:
-                    filtered.append(c)
-            except:
-                pass
-        logging.info(f"Delta filter: {len(filtered)} contracts with delta -0.50..-0.30")
-        final_contracts = filtered
-    else:
-        final_contracts = put_contracts
-
-    if not final_contracts:
-        logging.warning("No contracts after filtering. CSV will have headers only.")
 
     headers = ["conid", "symbol", "right", "month", "strike", "maturityDate",
                "bid", "ask", "delta", "gamma", "theta", "vega",
@@ -314,10 +340,30 @@ def writeResult(contracts_list):
     with open(filePath, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
-        for c in final_contracts:
+        for c in filtered_contracts:
             row = {h: c.get(h, "") for h in headers}
             writer.writerow(row)
-    logging.info(f"✅ CSV saved to {filePath}")
+    logging.info(f"✅ Options CSV saved to {filePath}")
+
+def save_stock_price_to_csv(stock_data):
+    """Speichert den Aktienkurs in einer eigenen CSV-Datei."""
+    if not stock_data:
+        logging.warning("No stock data to save.")
+        return
+    filePath = "./stock_price.csv"
+    file_exists = False
+    try:
+        with open(filePath, 'r') as f:
+            file_exists = True
+    except FileNotFoundError:
+        pass
+    
+    with open(filePath, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=["timestamp", "symbol", "conid", "last", "bid", "ask"])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(stock_data)
+    logging.info(f"✅ Stock price appended to {filePath}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -335,29 +381,58 @@ if __name__ == "__main__":
         logging.error(f"Failed to search for {ticker}: {e}")
         sys.exit(1)
 
+    # ----- AKTUELLEN AKTIENKURS ABRUFEN UND SPEICHERN -----
+    stock_info = get_stock_price(underConid, ticker)
+    if stock_info:
+        save_stock_price_to_csv(stock_info)
+        try:
+            current_stock_price_float = float(stock_info['last'])
+            logging.info(f"Aktueller Aktienkurs {ticker}: {current_stock_price_float}")
+        except (ValueError, TypeError):
+            logging.error("Kurs konnte nicht in float konvertiert werden. Filterung nach Strike nicht möglich.")
+            sys.exit(1)
+    else:
+        logging.error("Kein Aktienkurs erhalten. Breche ab.")
+        sys.exit(1)
+
     if not months:
         logging.error(f"No option months found for {ticker}")
         sys.exit(1)
 
-    # Monate in der von der API gelieferten Reihenfolge (kein Sortieren)
     selected_months = months[:num_months]
     logging.info(f"Selected months: {selected_months}")
 
-    all_contracts = []
+    # ----- SAMMLE NUR DIE 15 NÄCHSTEN STRIKES UNTER DEM AKTIENKURS (ÜBER ALLE MONATE) -----
+    candidate_strikes = []
+    
     for month in selected_months:
-        logging.info(f"Processing {month}...")
+        logging.info(f"Fetching strikes for {month}...")
         strikes = secdefStrikes(underConid, month)
-        number = 0
         for strike in strikes:
-            contracts = secdefInfo(underConid, month, strike, right="P")
-            for c in contracts:
-                c["month"] = month
-                all_contracts.append(c)
-                number += 1
-                # if number == 2:
-                #
-                #     break
-            # break
-
-    logging.info(f"Total contracts fetched: {len(all_contracts)}")
+            try:
+                s = float(strike)
+                if s < current_stock_price_float:
+                    candidate_strikes.append((month, s))
+            except (ValueError, TypeError):
+                logging.warning(f"Invalid strike value: {strike}")
+    
+    if not candidate_strikes:
+        logging.warning("No strikes below current stock price found.")
+        top_15_pairs = []
+    else:
+        candidate_strikes.sort(key=lambda x: x[1], reverse=True)
+        top_15_pairs = candidate_strikes[:15]
+        logging.info(f"Selected {len(top_15_pairs)} strikes (max 15) below {current_stock_price_float}")
+    
+    # Contract-Details für die ausgewählten Strikes abrufen
+    all_contracts = []
+    for month, strike in top_15_pairs:
+        contracts = secdefInfo(underConid, month, strike, right="P")
+        for c in contracts:
+            c["month"] = month
+            all_contracts.append(c)
+    
+    logging.info(f"Total contracts fetched (after strike filtering): {len(all_contracts)}")
+    
+    # ----- MARKTDATEN FÜR DIESE KONTRAKTE ABRUFEN UND CSV SCHREIBEN -----
     writeResult(all_contracts)

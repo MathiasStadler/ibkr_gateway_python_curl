@@ -335,6 +335,7 @@ if __name__ == "__main__":
         logging.error(f"Failed to search for {ticker}: {e}")
         sys.exit(1)
 
+##
     if not months:
         logging.error(f"No option months found for {ticker}")
         sys.exit(1)

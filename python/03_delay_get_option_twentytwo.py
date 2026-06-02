@@ -6,7 +6,6 @@ import requests
 import urllib3
 import csv
 import json
-import pprint
 import time
 import logging
 from datetime import datetime
@@ -15,8 +14,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s : %(
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PREFERRED_EXCHANGES = ["NASDAQ", "NYSE", "NYSE MKT", "BATS", "SMART", "AMEX"]
-FILTER_DELTA = False          # True = nur Deltas -0.50..-0.30, False = alle
-FORCE_PUT_ONLY = True        # Entfernt alle Nicht-PUTs aus der CSV
+FILTER_DELTA = False
+FORCE_PUT_ONLY = True
 
 def authenticate_market_data():
     logging.info("Checking authentication...")
@@ -29,6 +28,36 @@ def authenticate_market_data():
     except Exception as e:
         logging.error(f"❌ Failed: {e}")
         return False
+
+def get_stock_price(conid, symbol):
+    logging.info(f"Fetching current stock price for {symbol} (conid={conid})...")
+    authenticate_market_data()
+    url = "https://localhost:4002/v1/api/iserver/marketdata/snapshot"
+    params = {"conids": conid, "fields": "31,84,86"}
+    try:
+        resp = requests.get(url, params=params, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and isinstance(data, list) and len(data) > 0:
+            item = data[0]
+            last = item.get("31", "N/A")
+            bid = item.get("84", "N/A")
+            ask = item.get("86", "N/A")
+            logging.info(f"✅ {symbol} - Last: {last}, Bid: {bid}, Ask: {ask}")
+            return {
+                "symbol": symbol,
+                "conid": conid,
+                "last": last,
+                "bid": bid,
+                "ask": ask,
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            logging.warning(f"Unexpected response: {data}")
+            return None
+    except Exception as e:
+        logging.error(f"Failed to fetch stock price: {e}")
+        return None
 
 def secdefSearch(symbol):
     url = f'https://localhost:4002/v1/api/iserver/secdef/search?symbol={symbol}'
@@ -110,122 +139,50 @@ def secdefInfo(conid, month, strike, right="P", exchange="SMART"):
         contracts.append(contractDetails)
     return contracts
 
-def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="100,101,104,106", max_attempts=2, delay=2, batch_size=10):
+def get_option_snapshot_bulk(conids):
     """
-    Abruf von Marktdaten im Streaming-Modus (snapshot=0), um generische Tick-Typen zu erhalten.
-    - fields: Bid (84), Ask (85), Delta (86), Gamma (87), Theta (88), Vega (89)
-    - generic_ticks: Option Volume (100), Open Interest (101), Historical Volatility (104), Implied Volatility (106)
+    Ruft Marktdaten für eine Liste von conids ab.
+    Verwendet snapshot=1 (Schnappschuss) mit allen gewünschten Feldern.
     """
     if not conids:
         return {}
     authenticate_market_data()
 
-    field_map = {
-        "84": "bid",
-        "85": "ask",
-        "86": "delta",
-        "87": "gamma",
-        "88": "theta",
-        "89": "vega"
-    }
-    generic_map = {
-        "100": "volume",
-        "101": "open_interest",
-        "104": "historical_volatility",
-        "106": "implied_volatility"
-    }
-
+    fields = "84,85,86,87,88,89"
+    generic_ticks = "100,101,104,106"
+    
     all_data = {}
-    total_batches = (len(conids) + batch_size - 1) // batch_size
-
+    batch_size = 10
     for i in range(0, len(conids), batch_size):
         batch = conids[i:i+batch_size]
-        batch_num = i//batch_size + 1
-        logging.info(f"Batch {batch_num}/{total_batches} ({len(batch)} contracts)")
-
         conid_str = ",".join(str(c) for c in batch)
-        # snapshot=0 für Streaming-Modus (ermöglicht generische Ticks)
-        url = f'https://localhost:4002/v1/api/iserver/marketdata/snapshot?conids={conid_str}&fields={fields}&genericTickList={generic_ticks}&snapshot=0'
-        logging.info(f"url mkt_date =>  {url}")
-        batch_data = {}
-        for attempt in range(max_attempts):
-            try:
-                resp = requests.get(url=url, verify=False)
-                resp.raise_for_status()
-                data = resp.json()
-
-                for item in data:
-                    conid = item.get("conid")
-                    if not conid:
-                        continue
-                    if conid not in batch_data:
-                        batch_data[conid] = {}
-
-                    # Standard-Felder
-                    for f_id, f_name in field_map.items():
-                        val = item.get(f_id)
-                        if val is not None:
-                            batch_data[conid][f_name] = val
-                            logging.info("f_id => (f_id)")
-                            logging.info(f" VAL => (f_id) (f_name) val =>  {val}")
-                        else:
-                            batch_data[conid][f_name] = ""
-
-                    # Generische Ticks aus der ersten Antwort
-                    for g_id, g_name in generic_map.items():
-                        val = item.get(g_id)
-                        if val is not None:
-                            batch_data[conid][g_name] = val
-                        else:
-                            batch_data[conid][g_name] = ""
-
-                # Warte kurz, dann zweite Anfrage für vollständige generische Daten
-                if attempt == 0:
-                    time.sleep(1)
-                    resp2 = requests.get(url=url, verify=False)
-                    resp2.raise_for_status()
-                    data2 = resp2.json()
-                    for item in data2:
-                        conid = item.get("conid")
-                        if not conid:
-                            continue
-                        if conid not in batch_data:
-                            batch_data[conid] = {}
-                        for g_id, g_name in generic_map.items():
-                            val = item.get(g_id)
-                            if val is not None:
-                                batch_data[conid][g_name] = val
-
-                # Prüfe Vollständigkeit (mindestens Basis-Felder)
-                complete = sum(1 for c in batch_data if all(f in batch_data[c] for f in field_map.values()))
-                logging.info(f"Batch {batch_num}, attempt {attempt+1}: {complete}/{len(batch)} complete")
-                if complete == len(batch):
-                    break
-                if attempt < max_attempts-1:
-                    time.sleep(delay*(attempt+1))
-            except Exception as e:
-                logging.error(f"Batch {batch_num}, attempt {attempt+1} failed: {e}")
-                if attempt < max_attempts-1:
-                    time.sleep(delay)
-                else:
-                    logging.warning(f"Batch {batch_num} failed after {max_attempts} attempts")
-
-        # Formatiere die Daten für diesen Batch
-        for conid, quote in batch_data.items():
-            formatted = {}
-            for f_name in field_map.values():
-                val = quote.get(f_name, "")
-                if f_name in ["bid", "ask"]:
-                    formatted[f_name] = str(val) if val not in ["", None] else ""
-                else:
-                    formatted[f_name] = val if val not in ["", None] else ""
-            for g_name in generic_map.values():
-                formatted[g_name] = quote.get(g_name, "")
-            all_data[conid] = formatted
-
-        if i + batch_size < len(conids):
-            time.sleep(1.5)
-
+        url = f'https://localhost:4002/v1/api/iserver/marketdata/snapshot?conids={conid_str}&fields={fields}&genericTickList={generic_ticks}&snapshot=1'
+        logging.info(f"Requesting market data for batch of {len(batch)} contracts")
+        try:
+            resp = requests.get(url, verify=False)
+            resp.raise_for_status()
+            data = resp.json()
+            for item in data:
+                cid = item.get("conid")
+                if not cid:
+                    continue
+                quote = {
+                    "bid": item.get("84", ""),
+                    "ask": item.get("85", ""),
+                    "delta": item.get("86", ""),
+                    "gamma": item.get("87", ""),
+                    "theta": item.get("88", ""),
+                    "vega": item.get("89", ""),
+                    "volume": item.get("100", ""),
+                    "open_interest": item.get("101", ""),
+                    "historical_volatility": item.get("104", ""),
+                    "implied_volatility": item.get("106", "")
+                }
+                all_data[cid] = quote
+            logging.info(f"Received data for {len(data)} contracts")
+        except Exception as e:
+            logging.error(f"Failed to fetch market data for batch: {e}")
+        time.sleep(0.5)
     return all_data
 
 def write_debug_log(contracts_list, filename="option_debug.log"):
@@ -248,6 +205,17 @@ def write_debug_log(contracts_list, filename="option_debug.log"):
     logging.info(f"Debug log written to {filename} with {len(contracts_list)} entries.")
 
 def writeResult(contracts_list):
+    """Ruft Marktdaten ab, reichert die Kontrakte an und schreibt CSV."""
+    if not contracts_list:
+        logging.warning("No contracts to process. CSV will be empty.")
+        headers = ["conid", "symbol", "right", "month", "strike", "maturityDate",
+                   "bid", "ask", "delta", "gamma", "theta", "vega",
+                   "volume", "open_interest", "historical_volatility", "implied_volatility"]
+        with open("./DelayOptionContracts.csv", 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+        return
+
     conid_to_contract = {c["conid"]: c for c in contracts_list}
     all_conids = list(conid_to_contract.keys())
     logging.info(f"Fetching market data for {len(all_conids)} contracts...")
@@ -257,55 +225,25 @@ def writeResult(contracts_list):
         if conid in conid_to_contract:
             conid_to_contract[conid].update(quote)
 
-    # Vorzeichenkorrektur für Put-Optionen (falls API positive Werte liefert)
-    for conid, contract in conid_to_contract.items():
+    # Vorzeichenkorrektur für Puts (Delta, Gamma)
+    for contract in contracts_list:
         if contract.get("right") == "P":
             if "delta" in contract and contract["delta"]:
                 try:
-                    delta_val = float(contract["delta"])
-                    if 0 <= delta_val <= 1:
-                        contract["delta"] = -delta_val
-                except (ValueError, TypeError):
+                    d = float(contract["delta"])
+                    if 0 <= d <= 1:
+                        contract["delta"] = -d
+                except:
                     pass
             if "gamma" in contract and contract["gamma"]:
                 try:
-                    gamma_val = float(contract["gamma"])
-                    if gamma_val > 0:
-                        contract["gamma"] = -gamma_val
-                except (ValueError, TypeError):
+                    g = float(contract["gamma"])
+                    if g > 0:
+                        contract["gamma"] = -g
+                except:
                     pass
 
     write_debug_log(contracts_list)
-
-    logging.info("DEBUG: First 10 deltas (raw):")
-    for i, c in enumerate(contracts_list[:10]):
-        logging.info(f"  {i+1}: conid={c.get('conid')}, delta={c.get('delta')}, right={c.get('right')}")
-
-    if FORCE_PUT_ONLY:
-        put_contracts = [c for c in contracts_list if c.get("right") == "P"]
-        logging.info(f"After right filter: {len(put_contracts)} out of {len(contracts_list)} are Puts")
-    else:
-        put_contracts = contracts_list
-
-    if FILTER_DELTA:
-        filtered = []
-        for c in put_contracts:
-            delta_raw = c.get("delta")
-            if delta_raw is None or delta_raw == "":
-                continue
-            try:
-                delta = float(delta_raw)
-                if -0.50 <= delta <= -0.30:
-                    filtered.append(c)
-            except:
-                pass
-        logging.info(f"Delta filter: {len(filtered)} contracts with delta -0.50..-0.30")
-        final_contracts = filtered
-    else:
-        final_contracts = put_contracts
-
-    if not final_contracts:
-        logging.warning("No contracts after filtering. CSV will have headers only.")
 
     headers = ["conid", "symbol", "right", "month", "strike", "maturityDate",
                "bid", "ask", "delta", "gamma", "theta", "vega",
@@ -314,10 +252,27 @@ def writeResult(contracts_list):
     with open(filePath, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
-        for c in final_contracts:
+        for c in contracts_list:
             row = {h: c.get(h, "") for h in headers}
             writer.writerow(row)
-    logging.info(f"✅ CSV saved to {filePath}")
+    logging.info(f"✅ Options CSV saved to {filePath}")
+
+def save_stock_price_to_csv(stock_data):
+    if not stock_data:
+        return
+    filePath = "./stock_price.csv"
+    file_exists = False
+    try:
+        with open(filePath, 'r') as f:
+            file_exists = True
+    except FileNotFoundError:
+        pass
+    with open(filePath, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=["timestamp", "symbol", "conid", "last", "bid", "ask"])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(stock_data)
+    logging.info(f"✅ Stock price appended to {filePath}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -327,7 +282,6 @@ if __name__ == "__main__":
     num_months = int(sys.argv[2]) if len(sys.argv) >= 3 else 4
 
     logging.info(f"Processing ticker: {ticker}, next {num_months} months")
-    logging.info(f"Delta filter: {'ON' if FILTER_DELTA else 'OFF'} (range -0.50 to -0.30)")
 
     try:
         underConid, months = secdefSearch(ticker)
@@ -335,29 +289,64 @@ if __name__ == "__main__":
         logging.error(f"Failed to search for {ticker}: {e}")
         sys.exit(1)
 
+    # Aktienkurs abrufen
+    stock_info = get_stock_price(underConid, ticker)
+    if stock_info:
+        save_stock_price_to_csv(stock_info)
+        # Versuche, den Kurs als Float zu parsen – mit Fallback auf Bid/Ask
+        try:
+            last_str = stock_info.get('last', '')
+            if last_str in ('', 'N/A', None):
+                bid_str = stock_info.get('bid', '')
+                ask_str = stock_info.get('ask', '')
+                if bid_str not in ('', 'N/A', None) and ask_str not in ('', 'N/A', None):
+                    current_price = (float(bid_str) + float(ask_str)) / 2.0
+                    logging.info(f"Verwende Mittelwert aus Bid/Ask: {current_price}")
+                else:
+                    raise ValueError(f"Kein gültiger Last, Bid oder Ask: last={last_str}, bid={bid_str}, ask={ask_str}")
+            else:
+                current_price = float(last_str)
+            logging.info(f"Aktueller Aktienkurs {ticker}: {current_price}")
+        except Exception as e:
+            logging.error(f"Kurs nicht konvertierbar: {e}")
+            sys.exit(1)
+    else:
+        logging.error("Kein Aktienkurs erhalten")
+        sys.exit(1)
+
     if not months:
         logging.error(f"No option months found for {ticker}")
         sys.exit(1)
 
-    # Monate in der von der API gelieferten Reihenfolge (kein Sortieren)
     selected_months = months[:num_months]
     logging.info(f"Selected months: {selected_months}")
 
-    all_contracts = []
+    # 15 nächste Strikes unter dem aktuellen Kurs
+    candidate_strikes = []
     for month in selected_months:
-        logging.info(f"Processing {month}...")
         strikes = secdefStrikes(underConid, month)
-        number = 0
         for strike in strikes:
+            try:
+                s = float(strike)
+                if s < current_price:
+                    candidate_strikes.append((month, s))
+            except:
+                pass
+
+    if not candidate_strikes:
+        logging.warning("Keine Strikes unter dem aktuellen Kurs gefunden.")
+        all_contracts = []
+    else:
+        candidate_strikes.sort(key=lambda x: x[1], reverse=True)
+        top_15 = candidate_strikes[:15]
+        logging.info(f"Selected {len(top_15)} strikes (max 15) below {current_price}")
+
+        all_contracts = []
+        for month, strike in top_15:
             contracts = secdefInfo(underConid, month, strike, right="P")
             for c in contracts:
                 c["month"] = month
                 all_contracts.append(c)
-                number += 1
-                # if number == 2:
-                #
-                #     break
-            # break
 
     logging.info(f"Total contracts fetched: {len(all_contracts)}")
     writeResult(all_contracts)

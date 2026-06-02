@@ -30,6 +30,46 @@ def authenticate_market_data():
         logging.error(f"❌ Failed: {e}")
         return False
 
+def get_stock_price(conid, symbol):
+    """
+    Ruft den aktuellen Aktienkurs (Underlying) über die REST-API (Methode 1) ab.
+    Verwendet den Endpunkt /iserver/marketdata/snapshot.
+    """
+    logging.info(f"Fetching current stock price for {symbol} (conid={conid})...")
+    
+    # Stelle sicher, dass die Session authentifiziert ist
+    authenticate_market_data()
+    
+    url = "https://localhost:4002/v1/api/iserver/marketdata/snapshot"
+    params = {
+        "conids": conid,
+        "fields": "31,84,86"   # 31 = last, 84 = bid, 86 = ask
+    }
+    try:
+        resp = requests.get(url, params=params, verify=False)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and isinstance(data, list) and len(data) > 0:
+            item = data[0]
+            last = item.get("31", "N/A")
+            bid = item.get("84", "N/A")
+            ask = item.get("86", "N/A")
+            logging.info(f"✅ {symbol} - Last: {last}, Bid: {bid}, Ask: {ask}")
+            return {
+                "symbol": symbol,
+                "conid": conid,
+                "last": last,
+                "bid": bid,
+                "ask": ask,
+                "timestamp": datetime.now().isoformat()
+            }
+        else:
+            logging.warning(f"Unexpected response structure: {data}")
+            return None
+    except Exception as e:
+        logging.error(f"Failed to fetch stock price for {symbol}: {e}")
+        return None
+
 def secdefSearch(symbol):
     url = f'https://localhost:4002/v1/api/iserver/secdef/search?symbol={symbol}'
     try:
@@ -166,8 +206,8 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
                         val = item.get(f_id)
                         if val is not None:
                             batch_data[conid][f_name] = val
-                            logging.info("f_id => (f_id)")
-                            logging.info(f" VAL => (f_id) (f_name) val =>  {val}")
+                            logging.info(f"f_id => {f_id}")
+                            logging.info(f" VAL => {f_id} {f_name} val =>  {val}")
                         else:
                             batch_data[conid][f_name] = ""
 
@@ -317,7 +357,27 @@ def writeResult(contracts_list):
         for c in final_contracts:
             row = {h: c.get(h, "") for h in headers}
             writer.writerow(row)
-    logging.info(f"✅ CSV saved to {filePath}")
+    logging.info(f"✅ Options CSV saved to {filePath}")
+
+def save_stock_price_to_csv(stock_data):
+    """Speichert den Aktienkurs in einer eigenen CSV-Datei."""
+    if not stock_data:
+        logging.warning("No stock data to save.")
+        return
+    filePath = "./stock_price.csv"
+    file_exists = False
+    try:
+        with open(filePath, 'r') as f:
+            file_exists = True
+    except FileNotFoundError:
+        pass
+    
+    with open(filePath, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=["timestamp", "symbol", "conid", "last", "bid", "ask"])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(stock_data)
+    logging.info(f"✅ Stock price appended to {filePath}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -334,6 +394,24 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Failed to search for {ticker}: {e}")
         sys.exit(1)
+
+    
+
+
+    # ** NEU: Aktienkurs abrufen und speichern **
+    stock_info = get_stock_price(underConid, ticker)
+    last = stock_info['last']
+    logging.info(f" Last => {last}")
+    print(f"{ticker} aktueller Kurs: {last}")
+    logging.info(f"Selected months: {last}")
+    if stock_info:
+        current_stock_price = stock_info['last']
+        print(f"{ticker} aktueller Kurs: {current_stock_price}")
+        exit
+        save_stock_price_to_csv(stock_info)
+        logging.info(f"ticker {ticker} akt price (stock_info)")
+    else:
+        logging.warning("Could not retrieve stock price.")
 
     if not months:
         logging.error(f"No option months found for {ticker}")
@@ -354,10 +432,6 @@ if __name__ == "__main__":
                 c["month"] = month
                 all_contracts.append(c)
                 number += 1
-                # if number == 2:
-                #
-                #     break
-            # break
 
     logging.info(f"Total contracts fetched: {len(all_contracts)}")
     writeResult(all_contracts)
