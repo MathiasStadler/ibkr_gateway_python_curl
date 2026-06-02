@@ -1,0 +1,3 @@
+conid,symbol,right,month,strike,maturityDate,bid,ask,delta,gamma,theta,vega,volume,open_interest,historical_volatility,implied_volatility
+
+abferagen aller dieser Felder
