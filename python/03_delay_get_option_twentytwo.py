@@ -23,7 +23,7 @@ def authenticate_market_data():
     try:
         resp = requests.get(url=url, verify=False)
         resp.raise_for_status()
-        logging.info("✅ Market data session initialized.")
+        logging.info("================> ✅ Market data session initialized.")
         return True
     except Exception as e:
         logging.error(f"❌ Failed: {e}")
@@ -139,7 +139,201 @@ def secdefInfo(conid, month, strike, right="P", exchange="SMART"):
         contracts.append(contractDetails)
     return contracts
 
-def get_option_snapshot_bulk(conids):
+def old_two_get_option_snapshot_bulk(conids):
+    """
+    Ruft Marktdaten für eine Liste von conids ab.
+    Aufgeteilt in drei Requests:
+    1. Bid/Ask (84,85)
+    2. Greeks (86,87,88,89)
+    3. Generic Ticks (100,101,104,106)
+    """
+    if not conids:
+        return {}
+    
+    authenticate_market_data()
+    
+    # Definiere die drei Feldergruppen
+    field_groups = [
+        {"fields": "84,85", "name": "bid_ask"},           # Gruppe 1
+        {"fields": "86,87,88,89", "name": "greeks"},      # Gruppe 2
+        {"genericTickList": "100,101,104,106", "name": "generic"}  # Gruppe 3
+    ]
+    
+    all_data = {}
+    batch_size = 10   # Kleine Batches halten, um Timeouts zu vermeiden
+    
+    for i in range(0, len(conids), batch_size):
+        batch = conids[i:i+batch_size]
+        conid_str = ",".join(str(c) for c in batch)
+        
+        # Temporärer Speicher für diesen Batch
+        batch_data = {cid: {} for cid in batch}
+        
+        for group in field_groups:
+            # URL für diese Gruppe zusammensetzen
+            url = f'https://localhost:4002/v1/api/iserver/marketdata/snapshot?conids={conid_str}&snapshot=1'
+            if "fields" in group:
+                url += f"&fields={group['fields']}"
+            if "genericTickList" in group:
+                url += f"&genericTickList={group['genericTickList']}"
+            
+            logging.info(f"Request {group['name']} für Batch {i//batch_size + 1}")
+            try:
+                resp = requests.get(url, verify=False)
+                resp.raise_for_status()
+                data = resp.json()
+                
+                # Ergebnisse in batch_data einfügen
+                for item in data:
+                    cid = item.get("conid")
+                    if not cid:
+                        continue
+                    # Nur die Felder dieser Gruppe übernehmen
+                    if group['name'] == 'bid_ask':
+                        batch_data[cid]["bid"] = item.get("84", "")
+                        batch_data[cid]["ask"] = item.get("85", "")
+                    elif group['name'] == 'greeks':
+                        batch_data[cid]["delta"] = item.get("86", "")
+                        batch_data[cid]["gamma"] = item.get("87", "")
+                        batch_data[cid]["theta"] = item.get("88", "")
+                        batch_data[cid]["vega"] = item.get("89", "")
+                    elif group['name'] == 'generic':
+                        batch_data[cid]["volume"] = item.get("100", "")
+                        batch_data[cid]["open_interest"] = item.get("101", "")
+                        batch_data[cid]["historical_volatility"] = item.get("104", "")
+                        batch_data[cid]["implied_volatility"] = item.get("106", "")
+                        
+            except Exception as e:
+                logging.error(f"Fehler bei Gruppe {group['name']}: {e}")
+                # Bei Fehlern trotzdem mit leeren Werten weitermachen
+                continue
+            
+            # Kurze Pause zwischen den Requests, um den Server nicht zu überlasten
+            time.sleep(0.3)
+        
+        # Batch-Daten in Gesamtergebnis übernehmen
+        for cid, quote in batch_data.items():
+            all_data[cid] = quote
+        
+        logging.info(f"Batch {i//batch_size + 1} fertig, {len(batch_data)} Contracts")
+        time.sleep(0.5)  # Pause zwischen Batches
+    
+    return all_data
+
+def get_option_snapshot_bulk(conids, max_attempts=3):
+    """
+    Ruft Marktdaten für eine Liste von conids ab.
+    Wiederholt fehlgeschlagene Feldergruppen, bis alle Daten vorhanden sind.
+    
+    Args:
+        conids: Liste der ConIDs
+        max_attempts: Maximale Anzahl Wiederholungsversuche pro Feldergruppe
+    
+    Returns:
+        Dictionary mit ConID -> {feld: wert}
+    """
+    if not conids:
+        return {}
+
+    authenticate_market_data()
+
+    # Definiere die Feldergruppen mit ihren Feldnamen
+    groups = {
+        "bid_ask": {
+            "fields": "84,85",
+            "mapping": {"84": "bid", "85": "ask"}
+        },
+        "greeks": {
+            "fields": "86,87,88,89",
+            "mapping": {"86": "delta", "87": "gamma", "88": "theta", "89": "vega"}
+        },
+        "generic": {
+            "genericTickList": "100,101,104,106",
+            "mapping": {"100": "volume", "101": "open_interest", 
+                       "104": "historical_volatility", "106": "implied_volatility"}
+        }
+    }
+
+    # Initialisiere Ergebnis-Dictionary
+    all_data = {cid: {} for cid in conids}
+    
+    # Tracke für jede Conid, welche Gruppen bereits erfolgreich waren
+    # (alle Felder einer Gruppe sind gefüllt, wenn die Gruppe einmal erfolgreich war)
+    completed_groups = {cid: set() for cid in conids}
+
+    # Wiederhole für jede Gruppe separat mit maximalen Versuchen
+    for group_name, group_config in groups.items():
+        # Liste der Conids, für die diese Gruppe noch fehlt
+        missing_conids = [cid for cid in conids if group_name not in completed_groups[cid]]
+        attempt = 0
+        
+        while missing_conids and attempt < max_attempts:
+            attempt += 1
+            logging.info(f"Gruppe {group_name} - Versuch {attempt}/{max_attempts} für {len(missing_conids)} Contracts")
+            
+            # Verarbeite fehlende Conids in Batches
+            batch_size = 10
+            for i in range(0, len(missing_conids), batch_size):
+                batch = missing_conids[i:i+batch_size]
+                conid_str = ",".join(str(c) for c in batch)
+                
+                # URL zusammensetzen
+                url = f'https://localhost:4002/v1/api/iserver/marketdata/snapshot?conids={conid_str}&snapshot=1'
+                if "fields" in group_config:
+                    url += f"&fields={group_config['fields']}"
+                if "genericTickList" in group_config:
+                    url += f"&genericTickList={group_config['genericTickList']}"
+                
+                try:
+                    resp = requests.get(url, verify=False, timeout=10)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    
+                    # Ergebnisse einfügen
+                    for item in data:
+                        cid = item.get("conid")
+                        if not cid:
+                            continue
+                        # Prüfe, ob alle Felder dieser Gruppe geliefert wurden
+                        all_fields_present = True
+                        for src_field in group_config["mapping"].keys():
+                            logging.info(f"field => {src_field}")
+                            if src_field in item and item[src_field] not in (None, "", "N/A"):
+                                target_field = group_config["mapping"][src_field]
+                                logging.info(f"target_field {src_field} => {target_field}")
+                                all_data[cid][target_field] = item[src_field]
+                            else:
+                                all_fields_present = False
+                        
+                        if all_fields_present:
+                            completed_groups[cid].add(group_name)
+                    # Kurze Pause nach Batch
+                    time.sleep(0.3)
+                except Exception as e:
+                    logging.warning(f"Fehler in Gruppe {group_name}, Batch {i//batch_size+1}: {e}")
+                    # Bei Fehler nicht abbrechen, später erneut versuchen
+            
+            # Aktualisiere missing_conids für die nächste Iteration
+            missing_conids = [cid for cid in conids if group_name not in completed_groups[cid]]
+            
+            if missing_conids and attempt < max_attempts:
+                logging.info(f"Gruppe {group_name}: {len(missing_conids)} Contracts noch unvollständig, wiederhole...")
+                time.sleep(1)  # Warte vor Wiederholung
+        
+        if missing_conids:
+            logging.warning(f"Gruppe {group_name} nach {max_attempts} Versuchen nicht vollständig: {missing_conids}")
+    
+    # Fülle fehlende Felder mit leeren Strings
+    for cid in conids:
+        for group in groups.values():
+            for target_field in group["mapping"].values():
+                if target_field not in all_data[cid]:
+                    all_data[cid][target_field] = ""
+    
+    return all_data
+
+
+def old_get_option_snapshot_bulk(conids):
     """
     Ruft Marktdaten für eine Liste von conids ab.
     Verwendet snapshot=1 (Schnappschuss) mit allen gewünschten Feldern.
@@ -342,11 +536,14 @@ if __name__ == "__main__":
         logging.info(f"Selected {len(top_15)} strikes (max 15) below {current_price}")
 
         all_contracts = []
+        i = 0 
         for month, strike in top_15:
             contracts = secdefInfo(underConid, month, strike, right="P")
             for c in contracts:
                 c["month"] = month
                 all_contracts.append(c)
+                i = i + 1
+                print(i)
 
     logging.info(f"Total contracts fetched: {len(all_contracts)}")
     writeResult(all_contracts)
