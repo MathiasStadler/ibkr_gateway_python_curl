@@ -22,6 +22,7 @@ def authenticate_market_data():
     url = "https://localhost:4002/v1/api/iserver/accounts"
     try:
         resp = requests.get(url=url, verify=False)
+        time.sleep(1)
         resp.raise_for_status()
         logging.info("✅ Market data session initialized.")
         return True
@@ -45,6 +46,7 @@ def get_stock_price(conid, symbol):
     }
     try:
         resp = requests.get(url, params=params, verify=False)
+        time.sleep(1)
         resp.raise_for_status()
         data = resp.json()
         if data and isinstance(data, list) and len(data) > 0:
@@ -72,6 +74,7 @@ def secdefSearch(symbol):
     url = f'https://localhost:4002/v1/api/iserver/secdef/search?symbol={symbol}'
     try:
         search_request = requests.get(url=url, verify=False)
+        time.sleep(1)
         search_request.raise_for_status()
         data = search_request.json()
     except Exception as e:
@@ -128,6 +131,7 @@ def secdefSearch(symbol):
 def secdefStrikes(underConid, month, exchange="SMART"):
     url = f'https://localhost:4002/v1/api/iserver/secdef/strikes?conid={underConid}&secType=OPT&month={month}&exchange={exchange}'
     strike_request = requests.get(url=url, verify=False)
+    time.sleep(1)
     strikes = strike_request.json().get("put", [])
     logging.info(f"Month {month}: {len(strikes)} Put strikes")
     return strikes
@@ -135,6 +139,7 @@ def secdefStrikes(underConid, month, exchange="SMART"):
 def secdefInfo(conid, month, strike, right="P", exchange="SMART"):
     url = f'https://localhost:4002/v1/api/iserver/secdef/info?conid={conid}&month={month}&strike={strike}&secType=OPT&right={right}&exchange={exchange}'
     info_request = requests.get(url=url, verify=False)
+    time.sleep(1)
     contracts = []
     for contract in info_request.json():
         contract_right = contract.get("right", right)
@@ -186,6 +191,7 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
         len_conids=len(conids)
 
     for i in range(0, len_conids, batch_size):
+        logging.info(f"{i}")
         batch = conids[i:i+batch_size]
         batch_num = i//batch_size + 1
         logging.info(f"Batch {batch_num}/{total_batches} ({len(batch)} contracts)")
@@ -198,6 +204,7 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
         for attempt in range(max_attempts):
             try:
                 resp = requests.get(url=url, verify=False)
+                time.sleep(1)
                 resp.raise_for_status()
                 data = resp.json()
 
@@ -230,6 +237,7 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
                 if attempt == 0:
                     time.sleep(1)
                     resp2 = requests.get(url=url, verify=False)
+                    time.sleep(1)
                     resp2.raise_for_status()
                     data2 = resp2.json()
                     for item in data2:
@@ -392,6 +400,7 @@ if __name__ == "__main__":
 
     try:
         underConid, months = secdefSearch(ticker)
+        
     except Exception as e:
         logging.error(f"Failed to search for {ticker}: {e}")
         sys.exit(1)
@@ -432,14 +441,19 @@ if __name__ == "__main__":
             if strike > current_stock_price_float:
                 logging.info("continue")
                 continue
-            contracts = secdefInfo(underConid, month, strike, right="P")
+            contracts_all = secdefInfo(underConid, month, strike, right="P")
+            contracts = contracts_all[0]
             # ATTENTION contract of month with possibly weekly
             for c in contracts:
                 c["month"] = month
                 all_contracts.append(c)
                 conids=c["conid"]
+
+                arr = []
+                arr.append(conids)
                 # aufruf nur mit einer option chain
-                snapshot_data = get_option_snapshot_bulk(conids)
+                time.sleep(1)
+                snapshot_data = get_option_snapshot_bulk(arr)
 
     logging.info(f"Total contracts fetched (before filtering by strike): {len(all_contracts)}")
 
