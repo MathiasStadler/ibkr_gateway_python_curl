@@ -136,7 +136,30 @@ def secdefStrikes(underConid, month, exchange="SMART"):
     logging.info(f"Month {month}: {len(strikes)} Put strikes")
     return strikes
 
+
 def secdefInfo(conid, month, strike, right="P", exchange="SMART"):
+    """
+    Ruft alle Optionen (inkl. Weeklies) für einen Monat ab
+    und filtert diejenigen mit dem exakten Strike-Preis.
+    """
+    url = f'https://localhost:4002/v1/api/iserver/secdef/info?conid={conid}&month={month}&strike={strike}&secType=OPT&right={right}&exchange={exchange}'
+    info_request = requests.get(url=url, verify=False)
+
+    matching_contracts = []
+    for contract in info_request.json():
+        if contract.get("strike") == strike:
+            contract_details = {
+                "conid": contract["conid"],
+                "symbol": contract["symbol"],
+                "strike": contract["strike"],
+                "maturityDate": contract.get("maturityDate"),
+                "right": contract.get("right", right)
+            }
+            matching_contracts.append(contract_details)
+
+    return matching_contracts
+
+def old_secdefInfo(conid, month, strike, right="P", exchange="SMART"):
     url = f'https://localhost:4002/v1/api/iserver/secdef/info?conid={conid}&month={month}&strike={strike}&secType=OPT&right={right}&exchange={exchange}'
     info_request = requests.get(url=url, verify=False)
     time.sleep(1)
@@ -442,6 +465,8 @@ if __name__ == "__main__":
                 logging.info("continue")
                 continue
             contracts_all = secdefInfo(underConid, month, strike, right="P")
+            # ACHTUNG REIHENFOLGE YEAR MONTH DAY
+            # HIER WEITER ALLE WEEKLYS ABRUFEN
             contracts = contracts_all[0]
             # ATTENTION contract of month with possibly weekly
             for c in contracts:

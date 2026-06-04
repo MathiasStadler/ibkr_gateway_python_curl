@@ -4,3 +4,6 @@ abferagen aller dieser Felder
 
 
 python/03_delay_get_option_twenteen.py => 404 contracts = contracts_all[0]
+
+# ACHTUNG REIHENFOLGE YEAR MONTH DAY
+            # HIER WEITER ALLE WEEKLYS ABRUFEN
