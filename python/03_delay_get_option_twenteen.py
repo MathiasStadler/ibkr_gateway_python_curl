@@ -174,9 +174,18 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
     }
 
     all_data = {}
-    total_batches = (len(conids) + batch_size - 1) // batch_size
 
-    for i in range(0, len(conids), batch_size):
+    if isinstance(conids, int):
+        print(f"Success: {conids} is a valid integer count.")
+        # nur ein wert KEINE LISTE
+        total_batches = 1
+        len_conids=1
+    else:
+        print(f"Error: {conids} must be a whole number.")
+        total_batches = (len(conids) + batch_size - 1) // batch_size
+        len_conids=len(conids)
+
+    for i in range(0, len_conids, batch_size):
         batch = conids[i:i+batch_size]
         batch_num = i//batch_size + 1
         logging.info(f"Batch {batch_num}/{total_batches} ({len(batch)} contracts)")
@@ -413,11 +422,24 @@ if __name__ == "__main__":
     for month in selected_months:
         logging.info(f"Processing {month}...")
         strikes = secdefStrikes(underConid, month)
+        strikes.reverse()
         for strike in strikes:
+        #######
+            # runden auf ganze dollar
+            strike = float(strike)
+            logging.info(f"Strike=>{strike}")
+            logging.info(f" Strike {strike} Price {current_stock_price_float}")
+            if strike > current_stock_price_float:
+                logging.info("continue")
+                continue
             contracts = secdefInfo(underConid, month, strike, right="P")
+            # ATTENTION contract of month with possibly weekly
             for c in contracts:
                 c["month"] = month
                 all_contracts.append(c)
+                conids=c["conid"]
+                # aufruf nur mit einer option chain
+                snapshot_data = get_option_snapshot_bulk(conids)
 
     logging.info(f"Total contracts fetched (before filtering by strike): {len(all_contracts)}")
 
