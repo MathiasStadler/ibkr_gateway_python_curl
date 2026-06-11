@@ -12,7 +12,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "args": "PLTR 1"
+            "args": "SBUX 1"
         }
     ]
 }

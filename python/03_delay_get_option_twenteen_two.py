@@ -186,7 +186,7 @@ def old_secdefInfo(conid, month, strike, right="P", exchange="SMART"):
         contracts.append(contractDetails)
     return contracts
 
-def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="100,101,104,106", max_attempts=2, delay=2, batch_size=10):
+def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="100,101,104,106", max_attempts=5, delay=2, batch_size=10):
     """
     Abruf von Marktdaten im Streaming-Modus (snapshot=0), um generische Tick-Typen zu erhalten.
     - fields: Bid (84), Ask (85), Delta (86), Gamma (87), Theta (88), Vega (89)
@@ -253,8 +253,8 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
                         val = item.get(f_id)
                         if val is not None:
                             batch_data[conid][f_name] = val
-                            logging.info(f"f_id => {f_id}")
-                            logging.info(f" VAL => {f_id} {f_name} val =>  {val}")
+                            logging.info(f"Field {f_name}  Nr. (f_id) => {val}")
+                            # logging.info(f" VAL => {f_id} {f_name} val =>  {val}")
                         else:
                             batch_data[conid][f_name] = ""
 
@@ -465,44 +465,56 @@ if __name__ == "__main__":
         logging.info(f"Processing {month}...")
         strikes = secdefStrikes(underConid, month)
         strikes.reverse()
-        
+        # FOUND HERE
+        # https://www.geeksforgeeks.org/python/how-to-get-first-n-items-from-a-list-in-python/
+        N=10
+        # WEITER USE only the firsd'10 strikes
+        srikes = [idx for idx in strikes if idx < N + 1]
+        logging.info(f"use the first 10 itwm")
         for strike in strikes:
         #######
             # runden auf ganze dollar
             strike = float(strike)
-            logging.info(f"Strike=>{strike}")
-            logging.info(f" Strike {strike} Price {current_stock_price_float}")
+            # logging.info(f"Strike=>{strike}")
+            logging.info(f"Test Strike=>{strike}")
+
             if strike > current_stock_price_float:
-                logging.info(f"continue strike {strike}")
+                logging.info(f"strike < price :: {strike} < {current_stock_price_float}")
+                logging.info(f"skip this strike")
                 continue
-            if strike < 136:
-                break
+            # differenz 100 $
+            #logging.info("Price between current_price and 100$ lower")
+            #TODO optionchain range debend from price level
+            #logging.info(f"Strike {strike} , cuurent_price {current_stock_price_float} and minimum price {current_stock_price_float-100.0} ")
+            #if strike < current_stock_price_float-100.0:
+            #    break
             # Get all option with price under strike
             contracts_all = secdefInfo(underConid, month, strike, right="P")
             # ACHTUNG REIHENFOLGE YEAR MONTH DAY
             # HIER WEITER ALLE WEEKLYS ABRUFEN
             # Falsch Da wir alle option des Monats sehen wollen
-            #contracts = contracts_all[0]
+            # contracts = contracts_all[0]
             # ATTENTION contract of month with possibly weekly
-            #counter = 0
-            # for c in contracts_all:
-            #     # c["month"] = month
-            #     all_contracts.append(c)
-            #     # conids=c["conid"]
+            counter = 0
+            for c in contracts_all:
+                 # c["month"] = month
+                 all_contracts.append(c)
+                 logging.info(f"Total strikes after add: {len(all_contracts)}")
+                 # conids=c["conid"]
 
-            #     # arr = []
-            #     # arr.append(c)
-            #     # aufruf nur mit einer option chain
-            #     time.sleep(1)
-            #     #HIER
-            #     # snapshot_data = get_option_snapshot_bulk(arr)
+                 # arr = []
+                 # arr.append(c)
+                 # aufruf nur mit einer option chain
+                 time.sleep(1)
+                 #HIER 501
+                 # snapshot_data = get_option_snapshot_bulk(arr)
 
     logging.info(f"Total contracts fetched (before filtering by strike): {len(all_contracts)}")
 
     # ----- FILTER: NUR DIE 10 NÄCHSTEN STRIKES UNTER DEM AKTIENKURS -----
     lower_strikes = []
-    # for contract in all_contracts:
-    for contract in   contracts_all:
+    for contract in all_contracts:
+    # for contract in   contracts_all:
         try:
             strike = float(contract.get("strike", 0))
             if strike < current_stock_price_float:
