@@ -461,7 +461,14 @@ if __name__ == "__main__":
 
     # Alle Put-Kontrakte sammeln (ohne Marktdaten)
     all_contracts = []
+    counter = 0
+    break_parent_for = 0
     for month in selected_months:
+        
+        if break_parent_for > 0: 
+            logging.info( f"Brek for loop at mounth => {month}")
+            break
+
         logging.info(f"Processing {month}...")
         strikes = secdefStrikes(underConid, month)
         strikes.reverse()
@@ -469,44 +476,51 @@ if __name__ == "__main__":
         # https://www.geeksforgeeks.org/python/how-to-get-first-n-items-from-a-list-in-python/
         N=10
         # WEITER USE only the firsd'10 strikes
-        srikes = [idx for idx in strikes if idx < N + 1]
-        logging.info(f"use the first 10 itwm")
+        # srikes = [idx for idx in strikes if idx < N + 1]
+        # funzt but wrong I will the 10 string under the current market price
+        # strikes = strikes[:10]
+        logging.info(f"use the first 10 item")
         for strike in strikes:
         #######
+            if break_parent_for > 0: 
+                logging.info( f"Brek for loop at mounth => {month}")
+                break
             # runden auf ganze dollar
             strike = float(strike)
             # logging.info(f"Strike=>{strike}")
             logging.info(f"Test Strike=>{strike}")
 
+            # find strikes under the current market price
+            if strike > current_stock_price_float:
+                logging.info(f"strike < price :: {strike} < {current_stock_price_float}")
+                logging.info(f"skip this strike => {strike} - over {current_stock_price_float}")
+                continue
+            # find/break found N strikes under thr market price
             if strike > current_stock_price_float:
                 logging.info(f"strike < price :: {strike} < {current_stock_price_float}")
                 logging.info(f"skip this strike")
                 continue
-            # differenz 100 $
-            #logging.info("Price between current_price and 100$ lower")
-            #TODO optionchain range debend from price level
-            #logging.info(f"Strike {strike} , cuurent_price {current_stock_price_float} and minimum price {current_stock_price_float-100.0} ")
-            #if strike < current_stock_price_float-100.0:
-            #    break
+            
             # Get all option with price under strike
             contracts_all = secdefInfo(underConid, month, strike, right="P")
             # ACHTUNG REIHENFOLGE YEAR MONTH DAY
             # HIER WEITER ALLE WEEKLYS ABRUFEN
-            # Falsch Da wir alle option des Monats sehen wollen
-            # contracts = contracts_all[0]
-            # ATTENTION contract of month with possibly weekly
-            counter = 0
+            
+            # wrong place - i will count all strike counter = 0
             for c in contracts_all:
                  # c["month"] = month
                  all_contracts.append(c)
-                 logging.info(f"Total strikes after add: {len(all_contracts)}")
-                 # conids=c["conid"]
+                 counter = counter +1
+                 logging.info( f"all_contracts => {counter}")
+                 # wrong dosen't work logging.info( f" all_contract.len() => {all_contracts.len()}" )
+                 if counter > 10: 
+                     break_parent_for = 1
+                     break
+                 
 
-                 # arr = []
-                 # arr.append(c)
-                 # aufruf nur mit einer option chain
+                 # pause for request
                  time.sleep(1)
-                 #HIER 501
+                 
                  # snapshot_data = get_option_snapshot_bulk(arr)
 
     logging.info(f"Total contracts fetched (before filtering by strike): {len(all_contracts)}")
