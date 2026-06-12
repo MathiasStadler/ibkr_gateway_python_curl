@@ -10,6 +10,9 @@ import time
 import logging
 from datetime import datetime
 
+# sort dict in list
+from operator import itemgetter
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s : %(lineno)d - %(message)s')
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -186,7 +189,8 @@ def old_secdefInfo(conid, month, strike, right="P", exchange="SMART"):
         contracts.append(contractDetails)
     return contracts
 
-def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="100,101,104,106", max_attempts=5, delay=2, batch_size=10):
+#def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="100,101,104,106", max_attempts=5, delay=2, batch_size=10):
+def get_option_snapshot_bulk(conids, fields="84,85", generic_ticks="100", max_attempts=5, delay=5, batch_size=10):
     """
     Abruf von Marktdaten im Streaming-Modus (snapshot=0), um generische Tick-Typen zu erhalten.
     - fields: Bid (84), Ask (85), Delta (86), Gamma (87), Theta (88), Vega (89)
@@ -212,7 +216,7 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
     }
 
     all_data = {}
-
+    # test einzelwert odder liste
     if isinstance(conids, int):
         print(f"Success: {conids} is a valid integer count.")
         # nur ein wert KEINE LISTE
@@ -232,6 +236,7 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
         conid_str = ",".join(str(c) for c in batch)
         # snapshot=0 für Streaming-Modus (ermöglicht generische Ticks)
         url = f'https://localhost:4002/v1/api/iserver/marketdata/snapshot?conids={conid_str}&fields={fields}&genericTickList={generic_ticks}&snapshot=0'
+        print(url)
         logging.info(f"url mkt_date =>  {url}")
         batch_data = {}
         for attempt in range(max_attempts):
@@ -525,11 +530,19 @@ if __name__ == "__main__":
 
     logging.info(f"Total contracts fetched (before filtering by strike): {len(all_contracts)}")
 
+    print(all_contracts)
     # ----- FILTER: NUR DIE 10 NÄCHSTEN STRIKES UNTER DEM AKTIENKURS -----
     lower_strikes = []
+    logging.info( f" Typ of all_contracts {type(all_contracts) }")
+    # sorted list - found here https://www.geeksforgeeks.org/python/sort-a-list-of-python-dictionaries-by-a-value/
+    sorted_list = sorted(all_contracts, key=itemgetter('maturityDate'))
+    print(sorted_list)
+    # PLEASE FIX sorted contract BAD METHODE
+    all_contracts = sorted_list
     for contract in all_contracts:
-    # for contract in   contracts_all:
+    # old can remove  for contract in   contracts_all:
         try:
+            # OLD CAN REMOVE logging.info( f" Typ of contract {type(contract) }")
             strike = float(contract.get("strike", 0))
             if strike < current_stock_price_float:
                 lower_strikes.append(contract)
@@ -539,6 +552,8 @@ if __name__ == "__main__":
     # Sortieren absteigend (höchste Strikes unter dem Kurs zuerst)
     lower_strikes.sort(key=lambda x: float(x.get("strike", 0)), reverse=True)
     
+    # TODO sort date and strike
+
     # Die ersten 10 nehmen
     top_10_underlying = lower_strikes[:10]
     logging.info(f"Nach Filter: {len(top_10_underlying)} Contracts (max 10) mit Strike < {current_stock_price_float}")
