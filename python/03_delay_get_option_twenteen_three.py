@@ -95,27 +95,32 @@ def get_stock_price(conid, symbol):
     if not success:
         return (None, f"Market data authentication failed: {err}")
 
-    url = "https://localhost:4002/v1/api/iserver/marketdata/snapshot"
-    params = {"conids": conid, "fields": "31,84,86"}
-    try:
-        resp = get_session().get(url, params=params, verify=False, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            resp = get_session().get(url, params=params, verify=False, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
 
-        if data and isinstance(data, list) and len(data) > 0:
-            item = data[0]
-            result = {
-                "symbol": symbol,
-                "conid": conid,
-                "last": str(item.get("31", "N/A")),
-                "bid": str(item.get("84", "N/A")) if item.get("84") else "N/A",
-                "ask": str(item.get("86", "N/A")) if item.get("86") else "N/A",
-                "timestamp": datetime.now().isoformat(),
-            }
-            return (result, None)
-        return (None, "Unexpected response structure")
-    except Exception as e:
-        return (None, f"Error fetching stock price: {e}")
+            if data and isinstance(data, list) and len(data) > 0:
+                item = data[0]
+                result = {
+                    "symbol": symbol,
+                    "conid": conid,
+                    "last": str(item.get("31", "N/A")),
+                    "bid": str(item.get("84", "N/A")) if item.get("84") else "N/A",
+                    "ask": str(item.get("86", "N/A")) if item.get("86") else "N/A",
+                    "timestamp": datetime.now().isoformat(),
+                }
+                return (result, None)
+            else:
+                return (None, "Unexpected response structure")
+        except Exception as e:
+            if attempt < max_attempts - 1:
+                time.sleep(3)
+                continue
+            else:
+                return (None, f"Error fetching stock price after {max_attempts} attempts: {e}")
 
 
 def secdefSearch(symbol):
