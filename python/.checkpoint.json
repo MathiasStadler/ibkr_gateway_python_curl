@@ -1,0 +1,1 @@
+{"last_run": "2026-07-01T22:15:07", "script_version": "04_delay_get_option_twenteen_three.py", "last_status": "missing_fields_89", "fix_status": "fallback_logic_added", "next_steps": ["remove_89_or_graceful_handling", "retry_tomorrow"]}
