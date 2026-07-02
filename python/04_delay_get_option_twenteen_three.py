@@ -426,15 +426,22 @@ class IBKRClient:
                         last = float(last_val) if last_val not in ("", None) else 0.0
                     except (ValueError, TypeError):
                         last = 0.0
-                    # Fallback: If last is 0, try to get it from a different field or use a default
+                    
+                    # If last price is 0 or missing, wait 3 seconds and retry
                     if last == 0.0:
-                        self.logger.warning(f"Last price is 0, using fallback logic")
-                        # Try to infer from bid/ask midpoint
-                        bid = float(item.get("84")) if item.get("84") else None
-                        ask = float(item.get("86")) if item.get("86") else None
-                        if bid and ask:
-                            last = (bid + ask) / 2.0
-                            self.logger.info(f"Using bid/ask midpoint as last: {last}")
+                        if attempt < self.config.max_retries - 1:
+                            self.logger.warning(f"Last price is 0 or missing, retrying in 3 seconds... (attempt {attempt + 1}/{self.config.max_retries})")
+                            time.sleep(3)
+                            continue
+                        else:
+                            self.logger.warning(f"Last price still 0 after all retries, using fallback logic")
+                            # Fallback: Try to infer from bid/ask midpoint
+                            bid = float(item.get("84")) if item.get("84") else None
+                            ask = float(item.get("86")) if item.get("86") else None
+                            if bid and ask:
+                                last = (bid + ask) / 2.0
+                                self.logger.info(f"Using bid/ask midpoint as last: {last}")
+                    
                     return Result.success(StockPrice(
                         symbol=symbol,
                         conid=conid,
@@ -451,11 +458,140 @@ class IBKRClient:
 
         return Result.failure("Max retries exceeded")
 
+    def is_market_open(self) -> Result:
+        """Check if US market is currently open (9:30 AM - 4:00 PM ET, Monday-Friday)"""
+        try:
+            # Get current time in EST/EDT
+            from datetime import datetime, time
+            import pytz
+            
+            # Try to get market status from IBKR API first
+            endpoint = "/iserver/marketdata/status"
+            auth = self.authenticate()
+            if not auth.ok:
+                # Fallback to time-based check if auth fails
+                eastern = pytz.timezone('US/Eastern')
+                now = datetime.now(eastern)
+                
+                # Check if it's a weekday (Monday=0, Sunday=6)
+                if now.weekday() >= 5:  # Saturday or Sunday
+                    return Result.failure("Market is closed (weekend)")
+                
+                # Market hours: 9:30 AM to 4:00 PM ET
+                market_open = time(9, 30)
+                market_close = time(16, 0)
+                current_time = now.time()
+                
+                if market_open <= current_time <= market_close:
+                    return Result.success(True)
+                else:
+                    return Result.failure(f"Market is closed (current time ET: {now.strftime('%H:%M')})")
+            
+            # Try API-based market status
+            result = self._get(endpoint)
+            if not result.ok:
+                # Fallback to time-based check
+                eastern = pytz.timezone('US/Eastern')
+                now = datetime.now(eastern)
+                
+                if now.weekday() >= 5:  # Saturday or Sunday
+                    return Result.failure("Market is closed (weekend)")
+                
+                market_open = time(9, 30)
+                market_close = time(16, 0)
+                current_time = now.time()
+                
+                if market_open <= current_time <= market_close:
+                    return Result.success(True)
+                else:
+                    return Result.failure(f"Market is closed (current time ET: {now.strftime('%H:%M')})")
+            
+            # Parse API response
+            data = result.data
+            if isinstance(data, dict) and 'market' in data:
+                market_status = data['market']
+                if market_status == 'open':
+                    return Result.success(True)
+                else:
+                    return Result.failure(f"Market is {market_status}")
+            else:
+                # Fallback to time-based check
+                eastern = pytz.timezone('US/Eastern')
+                now = datetime.now(eastern)
+                
+                if now.weekday() >= 5:  # Saturday or Sunday
+                    return Result.failure("Market is closed (weekend)")
+                
+                market_open = time(9, 30)
+                market_close = time(16, 0)
+                current_time = now.time()
+                
+                if market_open <= current_time <= market_close:
+                    return Result.success(True)
+                else:
+                    return Result.failure(f"Market is closed (current time ET: {now.strftime('%H:%M')})")
+                    
+        except ImportError:
+            # pytz not available, use basic time check
+            from datetime import datetime, time
+            now = datetime.now()
+            
+            # Simple weekday check (approximate)
+            if now.weekday() >= 5:  # Saturday or Sunday
+                return Result.failure("Market is closed (weekend)")
+            
+            # Approximate ET check (assuming local time is ET for simplicity)
+            market_open = time(9, 30)
+            market_close = time(16, 0)
+            current_time = now.time()
+            
+            if market_open <= current_time <= market_close:
+                return Result.success(True)
+            else:
+                return Result.failure(f"Market is closed (current time: {now.strftime('%H:%M')})")
+        except Exception as e:
+            return Result.failure(f"Error checking market status: {e}")
+
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+def rotate_log(path: str, logger: logging.Logger) -> None:
+    """Rotate log files: log -> log.1, log.1 -> log.2, etc. (max 5 rotations)"""
+    log_path = Path(path)
+    if not log_path.exists():
+        return
+    
+    # Find the highest existing rotation number
+    max_rotation = 0
+    for i in range(1, 6):  # Check up to 5 rotations
+        rotated_path = Path(f"{path}.{i}")
+        if rotated_path.exists():
+            max_rotation = i
+        else:
+            break
+    
+    # Delete the oldest if we're at max
+    if max_rotation >= 5:
+        oldest = Path(f"{path}.5")
+        if oldest.exists():
+            oldest.unlink()
+    
+    # Rotate existing files
+    for i in range(max_rotation, 0, -1):
+        old_path = Path(f"{path}.{i}")
+        new_path = Path(f"{path}.{i + 1}")
+        if old_path.exists():
+            old_path.rename(new_path)
+    
+    # Rename current log to .1
+    log_path.rename(Path(f"{path}.1"))
+    logger.info(f"Rotated log file to {path}.1")
+
 def write_debug_log(contracts: List[OptionContract], path: str, logger: logging.Logger) -> Result:
     try:
+        # Rotate existing log file before writing new one
+        rotate_log(path, logger)
+        
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"# Debug log created at {datetime.now().isoformat()}\n")
             f.write(f"# Total contracts: {len(contracts)}\n")
