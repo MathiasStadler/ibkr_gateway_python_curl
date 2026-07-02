@@ -382,24 +382,75 @@ class IBKRClient:
             max_attempts=10,
         )
 
-    # ------------------------------------------------------------------
-    # Helper: raw snapshot with retry, no field‑completion enforcement
-    # ------------------------------------------------------------------
-    @with_retry(max_attempts=5, base_delay=2.0, max_delay=30.0)
     def _snapshot_raw(
         self,
         conids: List[int],
         fields: str,
     ) -> Result:
-        """Fetch a snapshot for the given conids & fields, retrying on transient errors."""
+        """Fetch a snapshot for the given conids & fields, retrying on transient errors
+        and waiting for all requested fields to be present (non‑empty)."""
         if not conids:
             return Result.success({})
+
+        # Prepare field list for validation
+        field_list = [f.strip() for f in fields.split(",") if f.strip()]
+
         auth = self.authenticate()
         if not auth.ok:
             return Result.failure(f"Auth failed: {auth.error}")
+
         conid_str = ",".join(str(c) for c in conids)
         endpoint = f"/marketdata/snapshot?conids={conid_str}&fields={fields}&snapshot=0"
-        return self._get(endpoint)
+
+        for attempt in range(3):  # max 3 attempts
+            try:
+                resp = self.session.get(
+                    f"{self.config.base_url}{endpoint}",
+                    verify=self.config.verify_ssl,
+                    timeout=self.config.request_timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                # Validate that all requested fields are present and non‑empty in each item
+                items = data if isinstance(data, list) else [data]
+                all_good = True
+                for item in items:
+                    if not isinstance(item, dict):
+                        all_good = False
+                        break
+                    for fid in field_list:
+                        val = item.get(fid)
+                        if val in (None, ""):
+                            all_good = False
+                            break
+                    if not all_good:
+                        break
+
+                if all_good:
+                    self.logger.info(f"All fields received (attempt {attempt + 1})")
+                    return Result.success(data)
+                else:
+                    if attempt < 2:  # not last attempt
+                        self.logger.warning(
+                            f"Missing or empty fields in snapshot (attempt {attempt + 1}/3). "
+                            f"Retrying in 3s..."
+                        )
+                        time.sleep(3)
+                    else:
+                        self.logger.warning(
+                            f"Still missing or empty fields after 3 attempts; returning what we have"
+                        )
+                        return Result.success(data)
+
+            except Exception as e:
+                if attempt < 2:  # not last attempt
+                    self.logger.warning(f"Request failed (attempt {attempt + 1}/3): {e}. Retrying in 3s...")
+                    time.sleep(3)
+                else:
+                    return Result.failure(f"Request failed after 3 attempts: {e}")
+
+        # Should not reach here
+        return Result.failure("Unexpected exit from _snapshot_raw loop")
 
     def get_stock_price(self, conid: int, symbol: str) -> Result:
         auth = self.authenticate()
