@@ -401,9 +401,15 @@ class IBKRClient:
 
         conid_str = ",".join(str(c) for c in conids)
         endpoint = f"/marketdata/snapshot?conids={conid_str}&fields={fields}&snapshot=0"
+        self.logger.info(f"Endpoints {endpoint})")
 
         for attempt in range(3):  # max 3 attempts
             try:
+                resp = None
+                date = None
+                items = None
+
+
                 resp = self.session.get(
                     f"{self.config.base_url}{endpoint}",
                     verify=self.config.verify_ssl,
@@ -831,6 +837,7 @@ def main() -> int:
 
     # Define chunks of field IDs (max 3 per chunk)
     field_chunks = [
+        "84,85,86,100,101",   # bid, ask, delta
         "84,85,86",   # bid, ask, delta
         "100,101",    # volume, open_interest
         "87,88,89",   # gamma, theta, vega
