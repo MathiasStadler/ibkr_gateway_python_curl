@@ -100,7 +100,7 @@ class StockPrice:
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
 @dataclass
-class OptionContract:
+cls OptionContract:
     conid: int
     symbol: str
     strike: float
@@ -121,7 +121,7 @@ class OptionContract:
         return {k: (v if v is not None else "") for k, v in asdict(self).items()}
 
 @dataclass
-class SecdefSearchResult:
+cls SecdefSearchResult:
     under_conid: int
     months: List[str]
 
@@ -169,17 +169,14 @@ def with_retry(
 # IBKR Client
 # ----------------------------------------------------------------------
 class IBKRClient:
-    # fields we **must** have – Greeks only
     FIELD_MAP = {
         "84": "bid", "85": "ask", "86": "delta",
         "87": "gamma", "88": "theta", "89": "vega"
     }
-    # generic ticks that are nice‑to‑have but not strictly required
     GENERIC_MAP = {
         "100": "volume", "101": "open_interest",
         "104": "historical_volatility", "106": "implied_volatility"
     }
-    # required fields are ONLY the Greeks (no generic ticks)
     REQUIRED_FIELDS = (*FIELD_MAP.keys(),)
 
     def __init__(self, config: Config, logger: logging.Logger):
@@ -309,107 +306,16 @@ class IBKRClient:
                 ))
         return Result.success(contracts)
 
-    def fetch_with_field_complete(
-        self,
-        endpoint: str,
-        params: Optional[Dict[str, Any]] = None,
-        required_fields: Tuple[str, ...] = REQUIRED_FIELDS,
-        max_attempts: int = 15,               # more attempts for stubborn fields
-    ) -> Result:
-        """
-        Pulls `endpoint` and keeps retrying (with exponential back‑off)
-        until *all* `required_fields* are present in the response.
-        """
-        url = f"{self.config.base_url}{endpoint}"
-        missing = set(required_fields)
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                resp = self.session.get(
-                    url,
-                    params=params,
-                    verify=self.config.verify_ssl,
-                    timeout=self.config.request_timeout,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    for field in list(missing):
-                        # only discard a field when it actually has a non‑empty value
-                        if field in item and item[field] not in ("", None):
-                            missing.discard(field)
-
-                if not missing:
-                    self.logger.info(f"All required fields received (attempt {attempt})")
-                    return Result.success(data)
-
-                self.logger.warning(
-                    f"Attempt {attempt}/{max_attempts}: Missing fields {missing}. Retrying..."
-                )
-                # exponential back‑off with jitter
-                time.sleep(self.config.retry_base_delay * (2 ** (attempt - 1)))
-
-            except Exception as e:
-                self.logger.warning(f"Request failed (attempt {attempt}): {e}")
-                if attempt == max_attempts:
-                    return Result.failure(f"Request failed after {max_attempts} attempts: {e}")
-                time.sleep(self.config.retry_base_delay * (2 ** (attempt - 1)))
-
-        return Result.failure(f"Still missing fields after {max_attempts} attempts: {missing}")
-
-    @with_retry(max_attempts=5, base_delay=2.0, max_delay=30.0)
-    def get_market_snapshot(
-        self,
-        conids: List[int],
-        fields: str = "84,85,86,87,88,89,380,381,382,383,384,385,386",
-    ) -> Result:
-        """Wrapper that fetches a market snapshot for a set of conids."""
+    def _snapshot_single_field(self, conids: List[int], field: str) -> Result:
+        """Fetch a snapshot for the given conids for a SINGLE field, retrying on transient errors."""
+        endpoint = f"/marketdata/snapshot?conids={','.join(map(str,conids))}&fields={field}&snapshot=0"
         if not conids:
             return Result.success({})
-
         auth = self.authenticate()
         if not auth.ok:
             return Result.failure(f"Auth failed: {auth.error}")
-
-        conid_str = ",".join(str(c) for c in conids)
-        endpoint = f"/marketdata/snapshot?conids={conid_str}&fields={fields}&snapshot=0"
-
-        return self.fetch_with_field_complete(
-            endpoint=endpoint,
-            required_fields=self.REQUIRED_FIELDS,
-            max_attempts=10,
-        )
-
-    def _snapshot_raw(
-        self,
-        conids: List[int],
-        fields: str,
-    ) -> Result:
-        """Fetch a snapshot for the given conids & fields, retrying on transient errors
-        and waiting for all requested fields to be present (non‑empty)."""
-        if not conids:
-            return Result.success({})
-
-        # Prepare field list for validation
-        field_list = [f.strip() for f in fields.split(",") if f.strip()]
-
-        auth = self.authenticate()
-        if not auth.ok:
-            return Result.failure(f"Auth failed: {auth.error}")
-
-        conid_str = ",".join(str(c) for c in conids)
-        endpoint = f"/marketdata/snapshot?conids={conid_str}&fields={fields}&snapshot=0"
-        self.logger.info(f"Endpoints {endpoint})")
-
         for attempt in range(3):  # max 3 attempts
             try:
-                resp = None
-                date = None
-                items = None
-
-
                 resp = self.session.get(
                     f"{self.config.base_url}{endpoint}",
                     verify=self.config.verify_ssl,
@@ -417,46 +323,39 @@ class IBKRClient:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-                # Validate that all requested fields are present and non‑empty in each item
-                items = data if isinstance(data, list) else [data]
-                all_good = True
-                for item in items:
-                    if not isinstance(item, dict):
-                        all_good = False
-                        break
-                    for fid in field_list:
-                        val = item.get(fid)
-                        if val in (None, ""):
-                            all_good = False
-                            break
-                    if not all_good:
-                        break
-
-                if all_good:
-                    self.logger.info(f"All fields received (attempt {attempt + 1})")
-                    return Result.success(data)
-                else:
-                    if attempt < 2:  # not last attempt
-                        self.logger.warning(
-                            f"Missing or empty fields in snapshot (attempt {attempt + 1}/3). "
-                            f"Retrying in 3s..."
-                        )
-                        time.sleep(3)
-                    else:
-                        self.logger.warning(
-                            f"Still missing or empty fields after 3 attempts; returning what we have"
-                        )
-                        return Result.success(data)
-
+                return Result.success(data)
             except Exception as e:
-                if attempt < 2:  # not last attempt
+                if attempt < 2:
                     self.logger.warning(f"Request failed (attempt {attempt + 1}/3): {e}. Retrying in 3s...")
                     time.sleep(3)
                 else:
                     return Result.failure(f"Request failed after 3 attempts: {e}")
+        return Result.failure("Unexpected exit from retry loop")
 
-        # Should not reach here
-        return Result.failure("Unexpected exit from _snapshot_raw loop")
+    def _snapshot_raw(self, conids: List[int], fields: str) -> Result:
+        """Fetch a snapshot for the given conids & fields, retrying on transient errors (max 3 attempts, 3s wait)."""
+        if not conids:
+            return Result.success({})
+        field_list = [f.strip() for f in fields.split(",") if f.strip()]
+        merged: Dict[int, Dict[str, Any]] = {cid: {"conid": cid} for cid in conids}
+
+        for fid in field_list:
+            result = self._snapshot_single_field(conids, fid)
+            if not result.ok:
+                self.logger.warning(f"Failed to fetch field {fid}: {result.error}")
+                continue
+
+            data = result.data
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if isinstance(item, dict):
+                    cid = item.get("conid")
+                    if cid in merged:
+                        val = item.get(fid)
+                        if val is not None and val != "":
+                            merged[cid][fid] = val
+
+        return Result.success(list(merged.values()))
 
     def get_stock_price(self, conid: int, symbol: str) -> Result:
         auth = self.authenticate()
@@ -483,7 +382,7 @@ class IBKRClient:
                         last = float(last_val) if last_val not in ("", None) else 0.0
                     except (ValueError, TypeError):
                         last = 0.0
-                    
+
                     # If last price is 0 or missing, wait 3 seconds and retry
                     if last == 0.0:
                         if attempt < self.config.max_retries - 1:
@@ -494,19 +393,6 @@ class IBKRClient:
                             self.logger.warning(f"Last price still 0 after all retries, using fallback logic")
                             # Fallback: Try to infer from bid/ask midpoint
                             bid = float(item.get("84")) if item.get("84") else None
-                            ask = float(item.get("86")) if item.get("86") else None
-                            if bid and ask:
-                                last = (bid + ask) / 2.0
-                                self.logger.info(f"Using bid/ask midpoint as last: {last}")
-                    
-                    return Result.success(StockPrice(
-                        symbol=symbol,
-                        conid=conid,
-                        last=last,
-                        bid=float(item.get("84")) if item.get("84") else None,
-                        ask=float(item.get("86")) if item.get("86") else None,
-                    ))
-                return Result.failure("Unexpected response structure")
             except Exception as e:
                 if attempt < self.config.max_retries - 1:
                     time.sleep(3)
@@ -518,52 +404,38 @@ class IBKRClient:
     def is_market_open(self) -> Result:
         """Check if US market is currently open (9:30 AM - 4:00 PM ET, Monday-Friday)"""
         try:
-            # Get current time in EST/EDT
             from datetime import datetime, time
             import pytz
-            
-            # Try to get market status from IBKR API first
+
             endpoint = "/iserver/marketdata/status"
             auth = self.authenticate()
             if not auth.ok:
-                # Fallback to time-based check if auth fails
                 eastern = pytz.timezone('US/Eastern')
                 now = datetime.now(eastern)
-                
-                # Check if it's a weekday (Monday=0, Sunday=6)
-                if now.weekday() >= 5:  # Saturday or Sunday
+                if now.weekday() >= 5:
                     return Result.failure("Market is closed (weekend)")
-                
-                # Market hours: 9:30 AM to 4:00 PM ET
                 market_open = time(9, 30)
                 market_close = time(16, 0)
                 current_time = now.time()
-                
                 if market_open <= current_time <= market_close:
                     return Result.success(True)
                 else:
                     return Result.failure(f"Market is closed (current time ET: {now.strftime('%H:%M')})")
-            
-            # Try API-based market status
+
             result = self._get(endpoint)
             if not result.ok:
-                # Fallback to time-based check
                 eastern = pytz.timezone('US/Eastern')
                 now = datetime.now(eastern)
-                
-                if now.weekday() >= 5:  # Saturday or Sunday
+                if now.weekday() >= 5:
                     return Result.failure("Market is closed (weekend)")
-                
                 market_open = time(9, 30)
                 market_close = time(16, 0)
                 current_time = now.time()
-                
                 if market_open <= current_time <= market_close:
                     return Result.success(True)
                 else:
                     return Result.failure(f"Market is closed (current time ET: {now.strftime('%H:%M')})")
-            
-            # Parse API response
+
             data = result.data
             if isinstance(data, dict) and 'market' in data:
                 market_status = data['market']
@@ -572,36 +444,26 @@ class IBKRClient:
                 else:
                     return Result.failure(f"Market is {market_status}")
             else:
-                # Fallback to time-based check
                 eastern = pytz.timezone('US/Eastern')
                 now = datetime.now(eastern)
-                
-                if now.weekday() >= 5:  # Saturday or Sunday
+                if now.weekday() >= 5:
                     return Result.failure("Market is closed (weekend)")
-                
                 market_open = time(9, 30)
                 market_close = time(16, 0)
                 current_time = now.time()
-                
                 if market_open <= current_time <= market_close:
                     return Result.success(True)
                 else:
                     return Result.failure(f"Market is closed (current time ET: {now.strftime('%H:%M')})")
-                    
+
         except ImportError:
-            # pytz not available, use basic time check
             from datetime import datetime, time
             now = datetime.now()
-            
-            # Simple weekday check (approximate)
-            if now.weekday() >= 5:  # Saturday or Sunday
+            if now.weekday() >= 5:
                 return Result.failure("Market is closed (weekend)")
-            
-            # Approximate ET check (assuming local time is ET for simplicity)
             market_open = time(9, 30)
             market_close = time(16, 0)
             current_time = now.time()
-            
             if market_open <= current_time <= market_close:
                 return Result.success(True)
             else:
@@ -613,42 +475,36 @@ class IBKRClient:
 # Helpers
 # ----------------------------------------------------------------------
 def rotate_log(path: str, logger: logging.Logger) -> None:
-    """Rotate log files: log -> log.1, log.1 -> log.2, etc. (max 5 rotations)"""
     log_path = Path(path)
     if not log_path.exists():
         return
-    
-    # Find the highest existing rotation number
+
     max_rotation = 0
-    for i in range(1, 6):  # Check up to 5 rotations
+    for i in range(1, 6):
         rotated_path = Path(f"{path}.{i}")
         if rotated_path.exists():
             max_rotation = i
         else:
             break
-    
-    # Delete the oldest if we're at max
+
     if max_rotation >= 5:
         oldest = Path(f"{path}.5")
         if oldest.exists():
             oldest.unlink()
-    
-    # Rotate existing files
+
     for i in range(max_rotation, 0, -1):
         old_path = Path(f"{path}.{i}")
-        new_path = Path(f"{path}.{i + 1}")
+        new_path = Path(f"{path}.{i+1}")
         if old_path.exists():
             old_path.rename(new_path)
-    
-    # Rename current log to .1
+
     log_path.rename(Path(f"{path}.1"))
     logger.info(f"Rotated log file to {path}.1")
 
 def write_debug_log(contracts: List[OptionContract], path: str, logger: logging.Logger) -> Result:
     try:
-        # Rotate existing log file before writing new one
         rotate_log(path, logger)
-        
+
         with open(path, "w", encoding="utf-8") as f:
             f.write(f"# Debug log created at {datetime.now().isoformat()}\n")
             f.write(f"# Total contracts: {len(contracts)}\n")
@@ -793,7 +649,7 @@ def main() -> int:
     client = IBKRClient(config, logger)
 
     # ------------------- Find underlying conid -------------------
-    search_result = client.search_secdef(ticker)
+    search_result = client.search_secdec(ticker)
     if not search_result.ok:
         logger.error(f"Search failed: {search_result.error}")
         return 1
@@ -831,27 +687,25 @@ def main() -> int:
         return 0
 
     # --------------------------------------------------------------
-    # 1️⃣  Pull market snapshot in small chunks (max 3 fields per request)
+    # 1️⃣  Pull market snapshot - each field separately
     # --------------------------------------------------------------
     conids = [c.conid for c in top_contracts]
 
-    # Define chunks of field IDs (max 3 per chunk)
-    field_chunks = [
-        "84,85,86,100,101",   # bid, ask, delta
-        "84,85,86",   # bid, ask, delta
-        "100,101",    # volume, open_interest
-        "87,88,89",   # gamma, theta, vega
-        "104,106"     # historical_volatility, implied_volatility
+    # Define individual field groups for separate fetching
+    field_groups = [
+        ["84", "85", "86", "100", "101"],  # bid, ask, delta, volume, open_interest
+        ["87", "88", "89"],                # gamma, theta, vega
+        ["104", "106"]                     # historical_volatility, implied_volatility
     ]
 
-    # Prepare a dict to accumulate results per conid
     merged: Dict[int, Dict[str, Any]] = {cid: {"conid": cid} for cid in conids}
 
-    for chunk in field_chunks:
-        result = client._snapshot_raw(conids, chunk)
+    for group in field_groups:
+        fields_str = ",".join(group)
+        result = client._snapshot_raw(conids, fields_str)
         if not result.ok:
-            logger.warning(f"Snapshot chunk '{chunk}' failed: {result.error}")
-            continue  # keep whatever we have so far
+            logger.warning(f"Snapshot group '{fields_str}' failed: {result.error}")
+            continue
         data = result.data
         if not isinstance(data, list):
             data = [data]
@@ -873,7 +727,7 @@ def main() -> int:
                 if hasattr(c, key):
                     setattr(c, key, value)
 
-    # Re‑correct Greeks (some APIs return positive theta/vega that we want negative)
+    # Re-correct Greeks
     for c in top_contracts:
         correct_put_greeks(c)
 
