@@ -393,6 +393,10 @@ class IBKRClient:
                             self.logger.warning(f"Last price still 0 after all retries, using fallback logic")
                             # Fallback: Try to infer from bid/ask midpoint
                             bid = float(item.get("84")) if item.get("84") else None
+                            ask = float(item.get("86")) if item.get("86") else None
+                            if bid and ask:
+                                last = (bid + ask) / 2.0
+                                self.logger.info(f"Using bid/ask midpoint as last: {last}")
             except Exception as e:
                 if attempt < self.config.max_retries - 1:
                     time.sleep(3)
@@ -649,7 +653,7 @@ def main() -> int:
     client = IBKRClient(config, logger)
 
     # ------------------- Find underlying conid -------------------
-    search_result = client.search_secdec(ticker)
+    search_result = client.search_secdef(ticker)  # Fixed typo: search_secdef instead of search_secdec
     if not search_result.ok:
         logger.error(f"Search failed: {search_result.error}")
         return 1
