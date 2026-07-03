@@ -726,55 +726,68 @@ def main() -> int:
     if not top_contracts:
         logger.warning("No contracts with strike < current price.")
         write_csv([], config.csv_output, logger)
-        return 0
+        # --------------------------------------------------------------
+        # 1️⃣  Pull market snapshot - each field separately
+        # --------------------------------------------------------------
+        conids = [c.conid for c in top_contracts]
 
-    # --------------------------------------------------------------
-    # 1️⃣  Pull market snapshot - each field separately
-    # --------------------------------------------------------------
-    conids = [c.conid for c in top_contracts]
+        # Define API field ID → OptionContract attribute name mapping
+        FIELD_TO_ATTR = {
+            "84": "bid",
+            "85": "ask",
+            "86": "delta",
+            "87": "gamma",
+            "88": "theta",
+            "89": "vega",
+            "100": "volume",
+            "101": "open_interest",
+            "104": "historical_volatility",
+            "106": "implied_volatility",
+        }
 
-    # Define API field ID → OptionContract attribute name mapping
-    # Field 84 = bid, 85 = ask, 86 = delta, 87 = gamma, 88 = theta, 89 = vega
-    # Field 100 = volume, 101 = open_interest, 104 = historical_volatility, 106 = implied_volatility
-    FIELD_TO_ATTR = {
-        "84": "bid",
-        "85": "ask",
-        "86": "delta",
-        "87": "gamma",
-        "88": "theta",
-        "89": "vega",
-        "100": "volume",
-        "101": "open_interest",
-        "104": "historical_volatility",
-        "106": "implied_volatility",
-    }
+        merged: Dict[int, Dict[str, Any]] = {cid: {"conid": cid} for cid in conids}
 
-    merged: Dict[int, Dict[str, Any]] = {cid: {"conid": cid} for cid in conids}
+        # Fetch each field individually with "Wait-until-Filled" logic
+        for field_id, attr_name in FIELD_TO_ATTR.items():
+            logger.info(f"Fetching field {field_id} ({attr_name})...")
+        
+            # Attempt up to 3 times until values are filled for most contracts
+            for attempt in range(3):
+                result = client._snapshot_raw(conids, field_id)
+                if not result.ok:
+                    logger.warning(f"Attempt {attempt+1}/3: Field {field_id} snapshot failed: {result.error}")
+                    time.sleep(2)
+                    continue
+            
+                data = result.data
+                if not isinstance(data, list):
+                    data = [data]
+            
+                filled_count = 0
+                for item in data:
+                    if isinstance(item, dict):
+                        cid = item.get("conid")
+                        if cid in merged:
+                            field_value = item.get(field_id)
+                            if field_value is not None and field_value != "":
+                                merged[cid][attr_name] = field_value
+                                filled_count += 1
+            
+                # If we filled most of the contracts, we can stop retrying this field
+                if filled_count >= len(conids) * 0.8:
+                    logger.info(f"Field {field_id} successfully filled for {filled_count}/{len(conids)} contracts. Moving on.")
+                    break
+                else:
+                    logger.info(f"Field {field_id} only filled for {filled_count}/{len(conids)}. Retrying in 3s...")
+                    time.sleep(3)
 
-    # Fetch each field individually and map to correct attribute
-    for field_id, attr_name in FIELD_TO_ATTR.items():
-        result = client._snapshot_raw(conids, field_id)
-        if not result.ok:
-            logger.warning(f"Field '{field_id}' snapshot failed: {result.error}")
-            continue
-        data = result.data
-        if not isinstance(data, list):
-            data = [data]
-        for item in data:
-            if isinstance(item, dict):
-                cid = item.get("conid")
-                if cid in merged:
-                    field_value = item.get(field_id)
-                    if field_value is not None and field_value != "":
-                        merged[cid][attr_name] = field_value
-
-    # Apply accumulated data to OptionContract objects
-    for c in top_contracts:
-        attrs = merged.get(c.conid)
-        if attrs:
-            for attr, value in attrs.items():
-                if attr != "conid" and hasattr(c, attr):
-                    setattr(c, attr, value)
+        # Apply accumulated data to OptionContract objects
+        for c in top_contracts:
+            attrs = merged.get(c.conid)
+            if attrs:
+                for attr, value in attrs.items():
+                    if attr != "conid" and hasattr(c, attr):
+                        setattr(c, attr, value)
 
     # Re-correct Greeks
     for c in top_contracts:
