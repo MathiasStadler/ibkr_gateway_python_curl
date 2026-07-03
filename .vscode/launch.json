@@ -12,7 +12,7 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
-            "args": "SBUX 1"
+            "args": "TREX 1"
         }
     ]
 }
