@@ -1,4 +1,4 @@
-# 04_delay_get_option_twenteen_three.py
+# 04_delay_get_option_twenteen_four.py
 # -------------------------------
 # Verbesserte Version – mehr Robustheit, besseres Error-Handling, zentrale Request-Methode
 # -------------------------------
@@ -358,52 +358,90 @@ class IBKRClient:
         return Result.success(list(merged.values()))
 
     def get_stock_price(self, conid: int, symbol: str) -> Result:
-        auth = self.authenticate()
-        if not auth.ok:
-            return Result.failure(f"Auth failed: {auth.error}")
+            auth = self.authenticate()
+            if not auth.ok:
+                return Result.failure(f"Auth failed: {auth.error}")
 
-        endpoint = "/marketdata/snapshot"
-        params = {"conids": conid, "fields": "31,84,86", "snapshot": "0"}
+            endpoint = "/marketdata/snapshot"
+            params = {"conids": conid, "fields": "31,84,86", "snapshot": "0"}
 
-        for attempt in range(self.config.max_retries):
-            try:
-                resp = self.session.get(
-                    f"{self.config.base_url}{endpoint}",
-                    params=params,
-                    verify=self.config.verify_ssl,
-                    timeout=self.config.request_timeout,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                if data and isinstance(data, list) and len(data) > 0:
-                    item = data[0]
-                    last_val = item.get("31", 0)
-                    try:
-                        last = float(last_val) if last_val not in ("", None) else 0.0
-                    except (ValueError, TypeError):
-                        last = 0.0
-
-                    # If last price is 0 or missing, wait 3 seconds and retry
-                    if last == 0.0:
+            for attempt in range(self.config.max_retries):
+                try:
+                    resp = self.session.get(
+                        f"{self.config.base_url}{endpoint}",
+                        params=params,
+                        verify=self.config.verify_ssl,
+                        timeout=self.config.request_timeout,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                
+                    self.logger.debug(f"API response for {symbol}: {data}")
+                
+                    if not data or not isinstance(data, list) or len(data) == 0:
+                        self.logger.warning(f"Empty or invalid response, attempt {attempt + 1}/{self.config.max_retries}")
                         if attempt < self.config.max_retries - 1:
-                            self.logger.warning(f"Last price is 0 or missing, retrying in 3 seconds... (attempt {attempt + 1}/{self.config.max_retries})")
                             time.sleep(3)
                             continue
+                        return Result.failure("No data received from API")
+                
+                    item = data[0]
+                
+                    # Validate all required fields exist and are non-empty
+                    required_fields = {"31": "last_price", "84": "bid", "86": "ask"}
+                    missing_fields = []
+                    invalid_fields = []
+                
+                    for field_id, field_name in required_fields.items():
+                        val = item.get(field_id)
+                        if val is None or val == "":
+                            missing_fields.append(field_name)
                         else:
-                            self.logger.warning(f"Last price still 0 after all retries, using fallback logic")
-                            # Fallback: Try to infer from bid/ask midpoint
-                            bid = float(item.get("84")) if item.get("84") else None
-                            ask = float(item.get("86")) if item.get("86") else None
-                            if bid and ask:
-                                last = (bid + ask) / 2.0
-                                self.logger.info(f"Using bid/ask midpoint as last: {last}")
-            except Exception as e:
-                if attempt < self.config.max_retries - 1:
-                    time.sleep(3)
-                else:
-                    return Result.failure(f"Error fetching stock price: {e}")
-
-        return Result.failure("Max retries exceeded")
+                            try:
+                                float(val)
+                            except (ValueError, TypeError):
+                                invalid_fields.append(field_name)
+                
+                    if missing_fields or invalid_fields:
+                        self.logger.warning(f"Missing fields: {missing_fields}, Invalid fields: {invalid_fields}, attempt {attempt + 1}/{self.config.max_retries}")
+                        if attempt < self.config.max_retries - 1:
+                            time.sleep(3)
+                            continue
+                        # Use fallback logic for missing/invalid fields
+                        bid = float(item.get("84")) if item.get("84") else None
+                        ask = float(item.get("86")) if item.get("86") else None
+                        if bid and ask:
+                            last = (bid + ask) / 2.0
+                            self.logger.info(f"Using bid/ask midpoint as last: {last}")
+                            return Result.success(StockPrice(symbol=symbol, conid=conid, last=last, bid=bid, ask=ask))
+                        return Result.failure(f"Missing: {missing_fields}, Invalid: {invalid_fields}")
+                
+                    # All fields are valid - return success
+                    last = float(item["31"])
+                    bid = float(item["84"]) if item.get("84") else None
+                    ask = float(item["86"]) if item.get("86") else None
+                    return Result.success(StockPrice(symbol=symbol, conid=conid, last=last, bid=bid, ask=ask))
+                
+                except requests.RequestException as e:
+                    self.logger.error(f"Request error: {e}")
+                    if attempt < self.config.max_retries - 1:
+                        time.sleep(3)
+                    else:
+                        return Result.failure(f"Request failed: {e}")
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"JSON decode error: {e}")
+                    if attempt < self.config.max_retries - 1:
+                        time.sleep(3)
+                    else:
+                        return Result.failure(f"Invalid JSON: {e}")
+                except Exception as e:
+                    self.logger.error(f"Unexpected error: {e}")
+                    if attempt < self.config.max_retries - 1:
+                        time.sleep(3)
+                    else:
+                        return Result.failure(f"Error: {e}")
+        
+            return Result.failure("Max retries exceeded - this should not be reached")
 
     def is_market_open(self) -> Result:
         """Check if US market is currently open (9:30 AM - 4:00 PM ET, Monday-Friday)"""
