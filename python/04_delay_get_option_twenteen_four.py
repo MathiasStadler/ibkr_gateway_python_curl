@@ -760,18 +760,18 @@ def main() -> int:
                     continue
             
                 data = result.data
-                if not isinstance(data, list):
-                    data = [data]
-            
-                filled_count = 0
-                for item in data:
-                    if isinstance(item, dict):
-                        cid = item.get("conid")
-                        if cid in merged:
-                            field_value = item.get(field_id)
-                            if field_value is not None and field_value != "":
-                                merged[cid][attr_name] = field_value
-                                filled_count += 1
+                        if not isinstance(data, list):
+                            data = [data]
+        
+                        filled_count = 0
+                        for item in data:
+                            if isinstance(item, dict):
+                                cid = item.get("conid")
+                                if cid in merged:
+                                    field_value = item.get(field_id)
+                                    if field_value is not None and field_value != "":
+                                        merged[cid][attr_name] = field_value
+                                        filled_count += 1
             
                 # If we filled most of the contracts, we can stop retrying this field
                 if filled_count >= len(conids) * 0.8:
