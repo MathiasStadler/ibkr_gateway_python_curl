@@ -750,9 +750,14 @@ def main() -> int:
     INCLUDE_ADVANCED_GREEKS: bool = False  # Standard: delta(86) + theta(88) nur
 
     # Feldmapping mit dynamischer Auswahl basierend auf dem Flag
+    # Korrekte IBKR Feld-IDs für Delayed-Daten:
+    #   86 = Delta, 88 = Theta, 84 = Open Interest, 85 = Volume
+    #   (Feld 27 = Volume funktioniert bei Delayed nicht)
     FIELD_TO_ATTR = {
-        "86": "delta",  # Delta
-        "88": "theta",  # Theta
+        "86": "delta",              # Delta
+        "88": "theta",              # Theta
+        "85": "volume",             # Trading Volume (korrekte Feld-ID)
+        "84": "open_interest",      # Open Interest
     }
 
     # Aktivieren Sie Vega(89) und Rho (z.B. 107) wenn das Flag aktiviert ist
@@ -820,6 +825,68 @@ def main() -> int:
                     f"Field {field_id} only filled for {filled}/{len(conids)}. Retrying in 2s..."
                 )
                 time.sleep(2)
+
+    # -----------------------------------------------------------------
+    # Nachholer-Logik: fehlende Felder nach 2 Sekunden erneut abfragen
+    # -----------------------------------------------------------------
+    def has_missing_fields(contract: "OptionContract", required_attrs: set) -> bool:
+        """Prüft ob ein Vertrag noch leere/zahlentliche Werte für die geforderten Attribute hat."""
+        for attr in required_attrs:
+            val = getattr(contract, attr, None)
+            if val is None:
+                return True
+            try:
+                float(val)
+            except (ValueError, TypeError):
+                return True
+        return False
+
+    required_attrs = {"delta", "theta", "volume", "open_interest"}
+    if INCLUDE_ADVANCED_GREEKS:
+        required_attrs.update({"vega", "rho"})
+
+    # Sammle alle Kontrakte mit fehlenden Werten
+    missing_contracts = [c for c in top_contracts if has_missing_fields(c, required_attrs)]
+
+    if missing_contracts:
+        logger.info(f"Retrying {len(missing_contracts)} contracts with missing fields after 2s pause...")
+        time.sleep(2)
+
+        # Wiederhole nur die Felder die noch fehlen
+        for field_id, attr_name in FIELD_TO_ATTR.items():
+            # Prüfe ob irgendein Contract noch dieses Feld braucht
+            needs_retry = any(
+                getattr(c, attr_name, None) is None or not is_numeric(getattr(c, attr_name, None))
+                for c in missing_contracts
+            )
+            if not needs_retry:
+                continue
+
+            logger.info(f"Re-fetching field {field_id} ({attr_name}) for missing contracts...")
+            attempt = 0
+            while attempt < 3:
+                result = client._snapshot_single_field([c.conid for c in missing_contracts], field_id)
+                if result.ok:
+                    data = result.data
+                    if not isinstance(data, list):
+                        data = [data]
+                    for item in data:
+                        if isinstance(item, dict):
+                            cid = item.get("conid")
+                            if cid in merged:
+                                value = item.get(field_id)
+                                if value is not None:
+                                    try:
+                                        value = float(value)
+                                    except (ValueError, TypeError):
+                                        pass
+                                    merged[cid][attr_name] = value
+                    break
+                else:
+                    wait_time = 2 ** (attempt + 1)
+                    logger.warning(f"Retry {attempt+1}/3 for field {field_id}: {result.error}. Waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    attempt += 1
 
     for c in top_contracts:
         attrs = merged.get(c.conid)
