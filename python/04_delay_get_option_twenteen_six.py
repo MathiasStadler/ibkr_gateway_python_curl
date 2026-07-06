@@ -770,7 +770,7 @@ def main() -> int:
         logger.info(f"Fetching field {field_id} ({attr_name})...")
 
         for attempt in range(3):
-            result = self._snapshot_single_field(conids, field_id)
+            result = client._snapshot_single_field(conids, field_id)
             if not result.ok:
                 wait_time = 2 ** (attempt + 1)  # Exponential backoff: 2, 4, 8 seconds
                 logger.warning(
@@ -789,6 +789,11 @@ def main() -> int:
                     if cid in merged:
                         value = item.get(field_id)
                         if value is not None:
+                            # Convert numeric strings to float
+                            try:
+                                value = float(value)
+                            except (ValueError, TypeError):
+                                pass
                             merged[cid][attr_name] = value
 
             def is_numeric(val):
