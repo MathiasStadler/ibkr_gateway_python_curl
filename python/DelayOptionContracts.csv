@@ -1,3 +1,3 @@
 conid,symbol,right,strike,maturity_date,bid,ask,delta,gamma,theta,vega,volume,open_interest,historical_volatility,implied_volatility
-883055497,CROX,P,120.0,20260717,,,,,,,,,,
-883055451,CROX,P,115.0,20260717,,,,,,,,,,
+883055541,CROX,P,125.0,20260717,,,-4.3,,-73.0,,,,,
+883055497,CROX,P,120.0,20260717,,,-2.35,,-116.0,,,,,
