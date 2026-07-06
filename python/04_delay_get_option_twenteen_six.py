@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# 04_delay_get_option_twenteen_four.py
+# 04_delay_get_option_twenteen_six.py
 # -------------------------------
-# Verbesserte Version – mehr Robustheit, besseres Error-Handling, zentrale Request-Methode
+# Robust Version – CSV writes immediately regardless of missing fields
 # -------------------------------
-# start today 05.07.26
+
 from __future__ import annotations
 
 import sys
@@ -16,8 +16,9 @@ import urllib3
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Any, Dict, Tuple, List
-from pathlib import Path
 from functools import wraps
+from pathlib import Path
+import re
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -56,11 +57,9 @@ class Config:
     debug_log: str = "./option_debug.log"
     stock_price_csv: str = "./stock_price.csv"
 
-
     @property
     def base_url(self) -> str:
         return f"https://{self.ibkr_host}:{self.ibkr_port}{self.ibkr_base_path}"
-
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -164,7 +163,7 @@ def with_retry(
             for attempt in range(max_attempts):
                 try:
                     return func(*args, **kwargs)
-                except exceptions as e:  # type: ignore[assignment]
+                except exceptions as e:
                     last_exc = e
                     if attempt < max_attempts - 1:
                         delay = min(base_delay * (2 ** attempt), max_delay)
@@ -192,16 +191,11 @@ class IBKRClient:
         "87": "gamma",
         "88": "theta",
         "89": "vega",
-    }
-
-    GENERIC_MAP = {
         "100": "volume",
         "101": "open_interest",
         "104": "historical_volatility",
         "106": "implied_volatility",
     }
-
-    REQUIRED_FIELDS = (*FIELD_MAP.keys(),)
 
     def __init__(self, config: Config, logger: logging.Logger):
         self.config = config
@@ -211,7 +205,6 @@ class IBKRClient:
     @property
     def session(self) -> requests.Session:
         if self._session is None:
-            # Configure session with retry strategy, connection pooling, and headers
             retry_strategy = urllib3.util.retry.Retry(
                 total=5,
                 backoff_factor=1,
@@ -223,7 +216,6 @@ class IBKRClient:
                 max_retries=retry_strategy,
                 pool_connections=20,
                 pool_maxsize=20,
-                pool_blocksize=1024,
             )
             self._session = requests.Session()
             self._session.mount("https://", adapter)
@@ -362,7 +354,7 @@ class IBKRClient:
         auth = self.authenticate()
         if not auth.ok:
             return Result.failure(f"Auth failed: {auth.error}")
-        for attempt in range(3):  # max 3 attempts
+        for attempt in range(3):
             try:
                 resp = self.session.get(
                     f"{self.config.base_url}{endpoint}",
@@ -386,7 +378,9 @@ class IBKRClient:
         "Fetches multiple fields for the given conids."
         if not conids:
             return Result.success({})
+
         field_list = [f.strip() for f in fields.split(",") if f.strip()]
+
         merged: Dict[int, Dict[str, Any]] = {cid: {"conid": cid} for cid in conids}
         for field_id in field_list:
             result = self._snapshot_single_field(conids, field_id)
@@ -401,7 +395,6 @@ class IBKRClient:
                     if cid in merged:
                         val = item.get(field_id)
                         if val is not None:
-                            # Map field ID to attribute name and store the value
                             attr_name = self.FIELD_MAP.get(field_id)
                             if attr_name:
                                 merged[cid][attr_name] = val
@@ -416,7 +409,6 @@ class IBKRClient:
         endpoint = "/marketdata/snapshot"
         params = {"conids": conid, "fields": "31,84,86", "snapshot": "0"}
 
-        # Warte 3 Sekunden und wiederhole, wenn last nicht zurückgegeben wird
         for attempt in range(self.config.max_retries):
             try:
                 resp = self.session.get(
@@ -449,7 +441,6 @@ class IBKRClient:
                 else:
                     return Result.failure(f"Error: {e}")
 
-            # Find the first item in the response
             item = data[0] if isinstance(data, list) and len(data) > 0 else data
 
             if not isinstance(item, dict):
@@ -460,17 +451,15 @@ class IBKRClient:
                 else:
                     return Result.failure(f"Invalid response format: {type(item)}")
 
-            # Check specifically for the last price field (31) – wait 3s and retry if empty
             last_val = item.get("31")
             if last_val is None or last_val == "":
                 self.logger.warning(
                     f"Last price (field 31) is missing, attempt {attempt + 1}/{self.config.max_retries}"
                 )
                 if attempt < self.config.max_retries - 1:
-                    time.sleep(3)  # Wait 3 seconds as requested
+                    time.sleep(3)
                     continue
                 else:
-                    # After all attempts, fall back to bid/ask midpoint if available
                     bid_val = item.get("84")
                     ask_val = item.get("86")
                     if bid_val is not None and bid_val != "" and ask_val is not None and ask_val != "":
@@ -486,20 +475,16 @@ class IBKRClient:
                             pass
                     return Result.failure("Missing last price after all retries")
 
-            # Validate all required fields exist and are non-empty
-            required_fields = {"31": "last_price", "84": "bid", "86": "ask"}
+            numeric_pattern = re.compile(r"^-?\d+(\.\d+)?$")
+
             missing_fields = []
             invalid_fields = []
-
-            for field_id, field_name in required_fields.items():
+            for field_id, field_name in {"31": "last_price", "84": "bid", "86": "ask"}.items():
                 val = item.get(field_id)
                 if val is None or val == "":
                     missing_fields.append(field_name)
-                else:
-                    try:
-                        float(val)
-                    except (ValueError, TypeError):
-                        invalid_fields.append(field_name)
+                elif not numeric_pattern.match(str(val)):
+                    invalid_fields.append(field_name)
 
             if missing_fields or invalid_fields:
                 self.logger.warning(
@@ -508,7 +493,6 @@ class IBKRClient:
                 if attempt < self.config.max_retries - 1:
                     time.sleep(3)
                     continue
-                # Use fallback logic for missing/invalid fields
                 bid = float(item.get("84")) if item.get("84") else None
                 ask = float(item.get("86")) if item.get("86") else None
                 if bid and ask:
@@ -519,7 +503,6 @@ class IBKRClient:
                     )
                 return Result.failure(f"Missing: {missing_fields}, Invalid: {invalid_fields}")
 
-            # All fields are valid – return success
             last = float(item["31"])
             bid = float(item["84"]) if item.get("84") else None
             ask = float(item["86"]) if item.get("86") else None
@@ -553,7 +536,6 @@ def collect_contracts(
             logger.warning(f"No strikes found for month {month}")
             continue
 
-        # Filter for strikes <= current_price (OTM/ATM puts)
         filtered_strikes = [s for s in strikes if s <= current_price]
         if not filtered_strikes:
             logger.warning(
@@ -561,7 +543,6 @@ def collect_contracts(
             )
             continue
 
-        # Sort by strike descending (closest to ATM first) and take top N
         filtered_strikes.sort(reverse=True)
         selected_strikes = filtered_strikes[:max_per_month]
         logger.info(f"Month {month}: Selected strikes {selected_strikes}")
@@ -629,7 +610,6 @@ def write_csv(
     "Write contracts to CSV file."
     try:
         if not contracts:
-            # Write header only
             with open(csv_path, "w", newline="") as f:
                 writer = csv.DictWriter(
                     f,
@@ -695,7 +675,6 @@ def correct_put_greeks(contract: OptionContract) -> None:
             contract.gamma = abs(contract.gamma)
         if contract.vega is not None and contract.vega < 0:
             contract.vega = abs(contract.vega)
-        # Theta for puts is usually negative (time decay), IBKR often returns positive
         if contract.theta is not None and contract.theta > 0:
             contract.theta = -abs(contract.theta)
 
@@ -704,9 +683,9 @@ def main() -> int:
     "Main function – orchestrates the entire workflow."
     if len(sys.argv) < 4:
         print(
-            "Usage: python3 04_delay_get_option_twenteen_four.py <TICKER> <MONTHS> <MAX_PER_MONTH>"
+            "Usage: python3 04_delay_get_option_twenteen_six.py <TICKER> <MONTHS> <MAX_PER_MONTH>"
         )
-        print("Example: python3 04_delay_get_option_twenteen_four.py TREX 1 5")
+        print("Example: python3 04_delay_get_option_twenteen_six.py TREX 1 5")
         return 1
 
     ticker = sys.argv[1].upper()
@@ -717,7 +696,6 @@ def main() -> int:
         print("Error: MONTHS and MAX_PER_MONTH must be integers")
         return 1
 
-    # Setup
     config = Config.from_env()
     logger = setup_logging(config)
     client = IBKRClient(config, logger)
@@ -726,7 +704,6 @@ def main() -> int:
         f"Processing ticker: {ticker}, months: {num_months}, max/month: {max_per_month}"
     )
 
-    # 1️⃣ Search for underlying contract
     search_result = client.search_secdef(ticker)
     if not search_result.ok:
         logger.error(f"Secdef search failed: {search_result.error}")
@@ -738,7 +715,6 @@ def main() -> int:
         f"Underlying conid: {under_conid}, months: {months}"
     )
 
-    # 2️⃣ Get current stock price
     stock_result = client.get_stock_price(under_conid, ticker)
     if not stock_result.ok:
         logger.error(f"Stock price failed: {stock_result.error}")
@@ -748,7 +724,6 @@ def main() -> int:
     logger.info(f"Current price: {stock.last}")
     append_stock_price(stock, config.stock_price_csv, logger)
 
-    # 3️⃣ Collect option contracts
     contracts = collect_contracts(
         client, under_conid, months, stock.last, max_per_month, logger
     )
@@ -757,7 +732,6 @@ def main() -> int:
         write_csv([], config.csv_output, logger)
         return 0
 
-    # Sort & filter
     contracts.sort(key=lambda c: c.maturity_date)
     filtered = [c for c in contracts if c.strike < stock.last]
     filtered.sort(key=lambda c: c.strike, reverse=True)
@@ -770,42 +744,45 @@ def main() -> int:
 
     logger.info(f"Total contracts collected: {len(top_contracts)}")
 
-    # 4️⃣ Pull market snapshot – each field separately
     conids = [c.conid for c in top_contracts]
 
+    # Füge das Flag INCLUDE_ADVANCED_GREEKS hinzu
+    INCLUDE_ADVANCED_GREEKS: bool = False  # Standard: delta(86) + theta(88) nur
+
+    # Feldmapping mit dynamischer Auswahl basierend auf dem Flag
     FIELD_TO_ATTR = {
-        "84": "bid",
-        "85": "ask",
-        "86": "delta",
-        "87": "gamma",
-        "88": "theta",
-        "89": "vega",
-        "100": "volume",
-        "101": "open_interest",
-        "104": "historical_volatility",
-        "106": "implied_volatility",
+        "86": "delta",  # Delta
+        "88": "theta",  # Theta
     }
 
-    # Initialize merged dict with all fields for each conid
+    # Aktivieren Sie Vega(89) und Rho (z.B. 107) wenn das Flag aktiviert ist
+    if INCLUDE_ADVANCED_GREEKS:
+        FIELD_TO_ATTR.update({
+            "89": "vega",
+            "107": "rho"
+        })
+
+    field_ids = ",".join(FIELD_TO_ATTR.keys())
+
     merged: Dict[int, Dict[str, Any]] = {cid: {"conid": cid} for cid in conids}
+
     for field_id, attr_name in FIELD_TO_ATTR.items():
         logger.info(f"Fetching field {field_id} ({attr_name})...")
 
         for attempt in range(3):
-            result = client._snapshot_raw(conids, field_id)
+            result = self._snapshot_single_field(conids, field_id)
             if not result.ok:
+                wait_time = 2 ** (attempt + 1)  # Exponential backoff: 2, 4, 8 seconds
                 logger.warning(
-                    f"Attempt {attempt+1}/3: Field {field_id} snapshot failed: {result.error}"
+                    f"Attempt {attempt+1}/3: Field {field_id} snapshot failed: {result.error}. Retrying in {wait_time}s..."
                 )
-                time.sleep(2)
+                time.sleep(wait_time)
                 continue
 
-            # Normalise response to a list
             data = result.data
             if not isinstance(data, list):
                 data = [data]
 
-            # Distribute the received values using the correct attribute name
             for item in data:
                 if isinstance(item, dict):
                     cid = item.get("conid")
@@ -814,11 +791,21 @@ def main() -> int:
                         if value is not None:
                             merged[cid][attr_name] = value
 
-            # Check how many contracts now have a non-None value for this attribute
+            def is_numeric(val):
+                if val is None:
+                    return False
+                if isinstance(val, (int, float)):
+                    return True
+                try:
+                    float(val)
+                    return True
+                except (ValueError, TypeError):
+                    return False
+
             filled = sum(
-                1 for cid in conids if merged[cid][attr_name] is not None
+                1 for cid in conids if is_numeric(merged.get(cid, {}).get(attr_name))
             )
-            if filled >= len(conids) * 0.8:  # 80% filled → good enough
+            if filled >= len(conids) * 0.8:
                 logger.info(
                     f"Field {field_id} filled for {filled}/{len(conids)} contracts. Moving on."
                 )
@@ -829,7 +816,6 @@ def main() -> int:
                 )
                 time.sleep(2)
 
-    # Apply the collected data to OptionContract objects
     for c in top_contracts:
         attrs = merged.get(c.conid)
         if attrs:
@@ -837,11 +823,9 @@ def main() -> int:
                 if attr != "conid" and hasattr(c, attr):
                     setattr(c, attr, value)
 
-    # Re-correct Greeks
     for c in top_contracts:
         correct_put_greeks(c)
 
-    # Write debug log and CSV
     write_debug_log(top_contracts, config.debug_log, logger)
     csv_result = write_csv(top_contracts, config.csv_output, logger)
     if not csv_result.ok:
