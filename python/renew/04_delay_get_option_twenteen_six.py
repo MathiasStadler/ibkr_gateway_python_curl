@@ -5,12 +5,15 @@
 ------------------------------------
 Robust version – collects puts, snapshots market fields, corrects Greek
 signs for puts, and writes results to CSV immediately (even with missing
-fields). All public methods return Result objects.
+fields). All public methods return Result objects. Supports polling for
+market data to fill in delayed-mode fields over time.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
+import dataclasses
 import json
 import logging
 import os
@@ -41,12 +44,7 @@ class Config:
     batch_size: int = 10
     batch_delay: float = 1.5
     preferred_exchanges: Tuple[str, ...] = (
-        "NASDAQ",
-        "NYSE",
-        "NYSE MKT",
-        "BATS",
-        "SMART",
-        "AMEX",
+        "NASDAQ", "NYSE", "NYSE MKT", "BATS", "SMART", "AMEX",
     )
     filter_delta: bool = False
     force_put_only: bool = True
@@ -57,6 +55,8 @@ class Config:
     csv_output: str = "./DelayOptionContracts.csv"
     debug_log: str = "./option_debug.log"
     stock_price_csv: str = "./stock_price.csv"
+    poll_minutes: int = 3
+    poll_interval: int = 30
 
     @property
     def base_url(self) -> str:
@@ -67,15 +67,11 @@ class Config:
         env = os.environ
         return cls(
             ibkr_host=env.get("IBKR_HOST", "localhost"),
-            ibkr_port=int(env.get("IBKR_PORT", "4002") or "4002"),
+            ibkr_port=int(env.get("IBKR_PORT", "4002")),
             verify_ssl=env.get("IBKR_VERIFY_SSL", "false").lower() in ("true", "1", "yes"),
-            request_timeout=int(env.get("IBKR_TIMEOUT", "10") or "10"),
-            max_retries=int(env.get("IBKR_MAX_RETRIES", "3") or "3"),
-            log_level=getattr(
-                logging,
-                env.get("LOG_LEVEL", "INFO").upper(),
-                logging.INFO,
-            ),
+            request_timeout=int(env.get("IBKR_TIMEOUT", "10")),
+            max_retries=int(env.get("IBKR_MAX_RETRIES", "3")),
+            log_level=getattr(logging, env.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
         )
 
 
@@ -95,11 +91,6 @@ class Result:
     @classmethod
     def failure(cls, error: str) -> "Result":
         return cls(ok=False, error=error)
-
-    def unwrap(self) -> Any:
-        if not self.ok:
-            raise RuntimeError(f"Result is error: {self.error}")
-        return self.data
 
 
 # ----------------------------------------------------------------------
@@ -147,7 +138,7 @@ class SecdefSearchResult:
 # Logging Setup
 # ----------------------------------------------------------------------
 def setup_logging(config: Config) -> logging.Logger:
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger(__name__ + str(id(config)))
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter(config.log_format))
@@ -160,22 +151,15 @@ def setup_logging(config: Config) -> logging.Logger:
 # ----------------------------------------------------------------------
 # Retry Decorator
 # ----------------------------------------------------------------------
-def with_retry(
-    max_attempts: int = 3,
-    base_delay: float = 2.0,
-    max_delay: float = 30.0,
-):
+def with_retry(max_attempts: int = 3, base_delay: float = 2.0, max_delay: float = 30.0):
     def decorator(func: Any) -> Any:
         from functools import wraps
-
         @wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            last_exc: Optional[BaseException] = None
             for attempt in range(max_attempts):
                 try:
                     return func(*args, **kwargs)
-                except BaseException as exc:
-                    last_exc = exc
+                except Exception as exc:
                     if attempt < max_attempts - 1:
                         delay = min(base_delay * (2 ** attempt), max_delay)
                         logging.warning(
@@ -184,14 +168,9 @@ def with_retry(
                         )
                         time.sleep(delay)
                     else:
-                        logging.error(
-                            f"All {max_attempts} attempts failed for {func.__name__}: {exc}"
-                        )
+                        logging.error(f"All {max_attempts} attempts failed for {func.__name__}: {exc}")
                         raise
-            return Result.failure(f"All {max_attempts} attempts failed: {last_exc}")
-
         return wrapper
-
     return decorator
 
 
@@ -199,22 +178,14 @@ def with_retry(
 # IBKR Client
 # ----------------------------------------------------------------------
 FIELD_MAP: Dict[str, str] = {
-    "31": "last",
-    "84": "bid",
-    "85": "ask",
-    "86": "delta",
-    "87": "gamma",
-    "88": "theta",
-    "89": "vega",
-    "100": "volume",
-    "101": "open_interest",
-    "104": "historical_volatility",
-    "106": "implied_volatility",
+    "31": "last", "84": "bid", "85": "ask", "86": "delta",
+    "87": "gamma", "88": "theta", "89": "vega",
+    "100": "volume", "101": "open_interest",
+    "104": "historical_volatility", "106": "implied_volatility",
 }
 
 BASIC_FIELDS: List[str] = ["84", "85", "86", "87", "88", "89", "100", "101"]
-
-SNAPSHOT_FIELDS: List[str] = ["31", "84", "85", "86", "87", "88", "89", "100", "101"]
+SNAPSHOT_FIELDS: List[str] = ["31", "84", "85", "86", "87", "89", "100", "101"]
 
 
 class IBKRClient:
@@ -222,46 +193,31 @@ class IBKRClient:
         self.config = config
         self.logger = logger
         self._session: Optional[requests.Session] = None
-        self._authenticated = False
 
     @property
     def session(self) -> requests.Session:
         if self._session is None:
             retry_strategy = urllib3.util.retry.Retry(
-                total=5,
-                backoff_factor=1,
+                total=5, backoff_factor=1,
                 status_forcelist=[429, 500, 502, 503, 504],
                 allowed_methods=["GET", "POST"],
                 respect_retry_after_header=True,
             )
-            adapter = HTTPAdapter(
-                max_retries=retry_strategy,
-                pool_connections=20,
-                pool_maxsize=20,
-            )
+            adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
             self._session = requests.Session()
             self._session.mount("https://", adapter)
             self._session.mount("http://", adapter)
-            self._session.headers.update(
-                {
-                    "User-Agent": "ibkr-options-client/1.0",
-                    "Accept": "application/json",
-                    "Connection": "keep-alive",
-                }
-            )
-            self.logger.debug(
-                "Request session configured with retry and connection pooling"
-            )
+            self._session.headers.update({
+                "User-Agent": "ibkr-options-client/1.0",
+                "Accept": "application/json",
+                "Connection": "keep-alive",
+            })
         return self._session
 
-    def _url(self, endpoint: str) -> str:
-        return f"{self.config.base_url}{endpoint}"
-
     def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Result:
-        url = self._url(endpoint)
         try:
             resp = self.session.get(
-                url,
+                f"{self.config.base_url}{endpoint}",
                 params=params,
                 verify=self.config.verify_ssl,
                 timeout=self.config.request_timeout,
@@ -276,22 +232,18 @@ class IBKRClient:
     def authenticate(self) -> Result:
         result = self._get("/accounts")
         if result.ok:
-            self.logger.info("Market data session initialized.")
-            self._authenticated = True
+            self.logger.info("✅ Market data session initialized.")
         else:
-            self.logger.error(f"Authentication failed: {result.error}")
+            self.logger.error(f"❌ Authentication failed: {result.error}")
         return result
 
-    @with_retry(max_attempts=3, base_delay=2.0)
     def search_secdef(self, symbol: str) -> Result:
         result = self._get(f"/secdef/search?symbol={symbol}")
         if not result.ok:
             return result
-
         data = result.data
         if not isinstance(data, list):
             return Result.failure(f"Unexpected response type: {type(data)}")
-
         selected: Optional[Dict[str, Any]] = None
         for contract in data:
             if not isinstance(contract, dict):
@@ -305,28 +257,22 @@ class IBKRClient:
                         break
                 if selected:
                     break
-
-        if selected is None:
+        if not selected:
             for contract in data:
                 if not isinstance(contract, dict):
                     continue
                 for sec in contract.get("sections", []):
                     if sec.get("secType") == "OPT":
                         selected = contract
-                        self.logger.info(
-                            f"Fallback exchange: {contract.get('description', 'Unknown')}"
-                        )
+                        self.logger.info(f"Fallback exchange: {contract.get('description', 'Unknown')}")
                         break
                 if selected:
                     break
-
         if selected is None:
             return Result.failure(f"No option contract found for {symbol}")
-
         under_conid = selected.get("conid")
         if not under_conid:
             return Result.failure(f"No conid for {symbol}")
-
         months: List[str] = []
         for sec in selected.get("sections", []):
             if sec.get("secType") == "OPT":
@@ -334,63 +280,44 @@ class IBKRClient:
                 if months_str:
                     months = months_str.split(";")
                 break
-
         if not months:
             return Result.failure(f"No option months for {symbol}")
         return Result.success(SecdefSearchResult(under_conid=under_conid, months=months))
 
-    @with_retry(max_attempts=3, base_delay=2.0)
     def get_strikes(self, under_conid: int, month: str) -> Result:
-        result = self._get(
-            f"/secdef/strikes?conid={under_conid}&secType=OPT&month={month}&exchange=SMART"
-        )
+        result = self._get(f"/secdef/strikes?conid={under_conid}&secType=OPT&month={month}&exchange=SMART")
         if not result.ok:
             return result
         strikes = result.data.get("put", [])
         self.logger.info(f"Month {month}: {len(strikes)} Put strikes")
         return Result.success(strikes)
 
-    @with_retry(max_attempts=3, base_delay=2.0)
-    def get_contract_info(
-        self,
-        under_conid: int,
-        month: str,
-        strike: float,
-        right: str = "P",
-        exchange: str = "SMART",
-    ) -> Result:
-        result = self._get(
-            f"/secdef/info?conid={under_conid}&month={month}&strike={strike}&secType=OPT&right={right}&exchange={exchange}"
-        )
+    def get_contract_info(self, under_conid: int, month: str, strike: float, right: str = "P", exchange: str = "SMART") -> Result:
+        result = self._get(f"/secdef/info?conid={under_conid}&month={month}&strike={strike}&secType=OPT&right={right}&exchange={exchange}")
         if not result.ok:
             return result
-
-        contracts = [
-            OptionContract(
-                conid=c.get("conid", 0),
-                symbol=c.get("symbol", ""),
-                strike=c.get("strike", strike),
-                maturity_date=c.get("maturityDate", ""),
-                right=c.get("right", right),
-            )
-            for c in result.data
-            if isinstance(c, dict) and c.get("strike") == strike
-        ]
+        contracts = []
+        for c in result.data:
+            if isinstance(c, dict) and c.get("strike") == strike:
+                contracts.append(OptionContract(
+                    conid=c.get("conid", 0),
+                    symbol=c.get("symbol", ""),
+                    strike=c.get("strike", strike),
+                    maturity_date=c.get("maturityDate", ""),
+                    right=c.get("right", right),
+                ))
         return Result.success(contracts)
 
-    def _snapshot_single_field(
-        self, conids: List[int], field: str
-    ) -> Result:
+    def _snapshot_single_field(self, conids: List[int], field: str) -> Result:
         if not conids:
             return Result.success({})
-
         endpoint = "/marketdata/snapshot"
-        params: Dict[str, Any] = {
+        params = {
             "conids": ",".join(map(str, conids)),
             "fields": field,
             "snapshot": "0",
+            "mdType": 2,
         }
-
         for attempt in range(3):
             try:
                 resp = self.session.get(
@@ -403,36 +330,21 @@ class IBKRClient:
                 return Result.success(resp.json())
             except Exception as exc:
                 if attempt < 2:
-                    delay = 2 ** (attempt + 1)
-                    self.logger.warning(
-                        f"Snapshot field {field} attempt {attempt + 1}/3 failed: {exc}. "
-                        f"Retrying in {delay}s..."
-                    )
-                    time.sleep(delay)
+                    time.sleep(2 ** (attempt + 1))
                 else:
-                    return Result.failure(
-                        f"Snapshot field {field} failed after 3 attempts: {exc}"
-                    )
-
+                    return Result.failure(f"Snapshot field {field} failed: {exc}")
         return Result.failure("Unexpected exit from snapshot retry loop")
 
-    def _snapshot_fields(
-        self, conids: List[int], field_ids: List[str]
-    ) -> Result:
+    def _snapshot_fields(self, conids: List[int], field_ids: List[str]) -> Result:
         if not conids:
             return Result.success({})
-
         merged: Dict[int, Dict[str, Any]] = {cid: {"conid": cid} for cid in conids}
-
         for field_id in field_ids:
             result = self._snapshot_single_field(conids, field_id)
             if not result.ok:
                 self.logger.warning(f"Failed to fetch field {field_id}: {result.error}")
                 continue
-
-            data = result.data
-            items = data if isinstance(data, list) else [data]
-
+            items = result.data if isinstance(result.data, list) else [result.data]
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -446,9 +358,8 @@ class IBKRClient:
                     except (ValueError, TypeError):
                         pass
                     attr_name = FIELD_MAP.get(field_id)
-                    if attr_name and val not in ("", None):
+                    if attr_name and val not in (None, ""):
                         merged[cid][attr_name] = val
-
         return Result.success(list(merged.values()))
 
     def get_stock_price(self, conid: int, symbol: str) -> Result:
@@ -492,7 +403,6 @@ class IBKRClient:
                     continue
                 return Result.failure(f"Error: {exc}")
 
-            # Parse response inside the loop (move the parsing into the retry block)
             item = data[0] if isinstance(data, list) and len(data) > 0 else data
             if not isinstance(item, dict):
                 if attempt < self.config.max_retries - 1:
@@ -502,21 +412,14 @@ class IBKRClient:
 
             last_val = item.get("31")
             if last_val is None or last_val == "":
-                self.logger.warning(
-                    f"Last price (field 31) missing, attempt {attempt + 1}/{self.config.max_retries}"
-                )
-                # Fallback: use bid/ask midpoint
+                self.logger.warning(f"Last price (field 31) missing, attempt {attempt + 1}/{self.config.max_retries}")
                 try:
                     bid_val = float(item.get("84", 0))
                     ask_val = float(item.get("85", 0))
                     if bid_val > 0 and ask_val > 0:
                         mid = (bid_val + ask_val) / 2.0
                         self.logger.info(f"Using bid/ask midpoint as last: {mid}")
-                        return Result.success(
-                            StockPrice(
-                                symbol=symbol, conid=conid, last=mid, bid=bid_val, ask=ask_val
-                            )
-                        )
+                        return Result.success(StockPrice(symbol=symbol, conid=conid, last=mid, bid=bid_val, ask=ask_val))
                 except (ValueError, TypeError):
                     pass
                 if attempt < self.config.max_retries - 1:
@@ -527,9 +430,7 @@ class IBKRClient:
             last = float(item["31"])
             bid = float(item["84"]) if item.get("84") else None
             ask = float(item["85"]) if item.get("85") else None
-            return Result.success(
-                StockPrice(symbol=symbol, conid=conid, last=last, bid=bid, ask=ask)
-            )
+            return Result.success(StockPrice(symbol=symbol, conid=conid, last=last, bid=bid, ask=ask))
 
         return Result.failure("Max retries exceeded in get_stock_price")
 
@@ -543,68 +444,6 @@ class IBKRClient:
 # ----------------------------------------------------------------------
 # Helper Functions
 # ----------------------------------------------------------------------
-def _collect_contracts_for_month(
-    client: IBKRClient,
-    under_conid: int,
-    month: str,
-    max_per_month: int,
-    current_price: float,
-    logger: logging.Logger,
-) -> List[OptionContract]:
-    strikes_result = client.get_strikes(under_conid, month)
-    if not strikes_result.ok:
-        logger.warning(f"Failed to get strikes for month {month}: {strikes_result.error}")
-        return []
-
-    strikes = strikes_result.data
-    if not strikes:
-        logger.warning(f"No strikes found for month {month}")
-        return []
-
-    valid = sorted([s for s in strikes if s <= current_price], reverse=True)
-    if not valid:
-        logger.warning(f"No strikes <= current price ({current_price}) for month {month}")
-        return []
-
-    selected = valid[:max_per_month]
-    logger.info(f"Month {month}: Selected strikes {selected}")
-
-    contracts: List[OptionContract] = []
-    for strike in selected:
-        info = client.get_contract_info(under_conid, month, strike, "P")
-        if not info.ok:
-            logger.warning(
-                f"Failed to get contract info for {under_conid} {month} {strike}P: {info.error}"
-            )
-            continue
-        month_contracts = info.data
-        if not month_contracts:
-            logger.warning(f"No contracts returned for {under_conid} {month} {strike}P")
-            continue
-        contracts.extend(month_contracts)
-        logger.info(f"Month {month}: Collected {len(month_contracts)} contracts for strike {strike}")
-
-    return contracts
-
-
-def collect_contracts(
-    client: IBKRClient,
-    under_conid: int,
-    months: List[str],
-    current_price: float,
-    max_per_month: int,
-    logger: logging.Logger,
-) -> List[OptionContract]:
-    all_contracts: List[OptionContract] = []
-    for month in months:
-        all_contracts.extend(
-            _collect_contracts_for_month(
-                client, under_conid, month, max_per_month, current_price, logger
-            )
-        )
-    return all_contracts
-
-
 def resolve_field_map(level: str) -> List[str]:
     if level == "basic":
         return BASIC_FIELDS
@@ -625,21 +464,35 @@ def correct_put_greeks(contract: OptionContract) -> None:
             contract.vega = -contract.vega
 
 
-def attach_snapshot_data(
-    client: IBKRClient,
-    contracts: List[OptionContract],
-    field_ids: List[str],
-    logger: logging.Logger,
-) -> None:
-    conids = [c.conid for c in contracts]
-    if not conids:
-        return
+def collect_contracts(client: IBKRClient, under_conid: int, months: List[str], current_price: float, max_per_month: int, logger: logging.Logger) -> List[OptionContract]:
+    all_contracts: List[OptionContract] = []
+    for month in months:
+        strikes_result = client.get_strikes(under_conid, month)
+        if not strikes_result.ok:
+            logger.warning(f"Failed to get strikes for month {month}: {strikes_result.error}")
+            continue
+        strikes = strikes_result.data
+        if not strikes:
+            continue
+        valid = sorted([s for s in strikes if s <= current_price], reverse=True)
+        selected = valid[:max_per_month]
+        for strike in selected:
+            info = client.get_contract_info(under_conid, month, strike, "P")
+            if info.ok:
+                all_contracts.extend(info.data)
+            else:
+                logger.warning(f"Failed to get contract info for {under_conid} {month} {strike}P: {info.error}")
+    return all_contracts
 
+
+def attach_snapshot_data(client: IBKRClient, contracts: List[OptionContract], field_ids: List[str], logger: logging.Logger) -> None:
+    if not contracts:
+        return
+    conids = [c.conid for c in contracts]
     result = client._snapshot_fields(conids, field_ids)
     if not result.ok:
         logger.warning(f"Failed to attach snapshot data: {result.error}")
         return
-
     items = result.data if isinstance(result.data, list) else [result.data]
     for item in items:
         if not isinstance(item, dict):
@@ -661,9 +514,7 @@ def attach_snapshot_data(
                 break
 
 
-def append_stock_price_csv(
-    stock: StockPrice, csv_path: str, logger: logging.Logger
-) -> Result:
+def append_stock_price_csv(stock: StockPrice, csv_path: str, logger: logging.Logger) -> Result:
     try:
         path = Path(csv_path)
         file_exists = path.is_file()
@@ -679,9 +530,23 @@ def append_stock_price_csv(
         return Result.failure(f"Failed to append stock price to CSV: {exc}")
 
 
-def write_debug_log(
-    contracts: List[OptionContract], log_path: str, logger: logging.Logger
-) -> Result:
+def write_csv(contracts: List[OptionContract], csv_path: str, logger: logging.Logger) -> Result:
+    try:
+        path = Path(csv_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=HEADER_ORDER)
+            writer.writeheader()
+            for c in contracts:
+                writer.writerow(c.to_csv_row())
+        logger.info(f"Options CSV saved to {csv_path} ({len(contracts)} rows)")
+        return Result.success(True)
+    except Exception as exc:
+        logger.error(f"Failed to write CSV: {exc}")
+        return Result.failure(f"Failed to write CSV: {exc}")
+
+
+def write_debug_log(contracts: List[OptionContract], log_path: str, logger: logging.Logger) -> Result:
     try:
         with open(log_path, "w") as f:
             f.write(f"# Debug log created at {datetime.now().isoformat()}\n")
@@ -696,91 +561,41 @@ def write_debug_log(
 
 
 HEADER_ORDER = [
-    "conid",
-    "symbol",
-    "right",
-    "strike",
-    "maturity_date",
-    "bid",
-    "ask",
-    "delta",
-    "gamma",
-    "theta",
-    "vega",
-    "volume",
-    "open_interest",
-    "historical_volatility",
-    "implied_volatility",
+    "conid", "symbol", "right", "strike", "maturity_date",
+    "bid", "ask", "delta", "gamma", "theta", "vega",
+    "volume", "open_interest", "historical_volatility", "implied_volatility",
 ]
 
 
-def write_csv(contracts: List[OptionContract], csv_path: str, logger: logging.Logger) -> Result:
-    try:
-        path = Path(csv_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=HEADER_ORDER)
-            writer.writeheader()
-            for c in contracts:
-                writer.writerow(c.to_csv_row())
-
-        logger.info(f"Options CSV saved to {csv_path} ({len(contracts)} rows)")
-        return Result.success(True)
-    except Exception as exc:
-        logger.error(f"Failed to write CSV: {exc}")
-        return Result.failure(f"Failed to write CSV: {exc}")
-
-
-def parse_cli_args() -> Tuple[str, int, int]:
-    if len(sys.argv) < 4:
-        print(
-            "Usage: python3 04_delay_get_option_twenteen_six.py <TICKER> <MONTHS> <MAX_PER_MONTH>"
-        )
-        print("Example: python3 04_delay_get_option_twenteen_six.py TREX 1 5")
-        raise SystemExit(1)
-
-    ticker = sys.argv[1].upper()
-    try:
-        num_months = int(sys.argv[2])
-        max_per_month = int(sys.argv[3])
-    except ValueError:
-        print("Error: MONTHS and MAX_PER_MONTH must be integers")
-        raise SystemExit(1)
-
-    if num_months < 1:
-        print("Error: MONTHS must be >= 1")
-        raise SystemExit(1)
-    if max_per_month < 1:
-        print("Error: MAX_PER_MONTH must be >= 1")
-        raise SystemExit(1)
-
-    return ticker, num_months, max_per_month
+def parse_cli_args() -> Tuple[str, int, int, int, int]:
+    parser = argparse.ArgumentParser(description="Fetch delayed option contract data via IBKR Gateway REST API and write to CSV.")
+    parser.add_argument("ticker", help="Underlying ticker symbol (e.g. TREX)")
+    parser.add_argument("months", type=int, help="Number of expiry months to fetch")
+    parser.add_argument("max_per_month", type=int, help="Maximum contracts to collect per month")
+    parser.add_argument("--poll-minutes", type=int, default=3, help="Minutes to poll for market data (default: 3)")
+    parser.add_argument("--poll-interval", type=int, default=30, help="Seconds between polling attempts (default: 30)")
+    args = parser.parse_args()
+    return args.ticker.upper(), args.months, args.max_per_month, args.poll_minutes, args.poll_interval
 
 
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
 def main() -> int:
-    logger = setup_logging(Config())
-    client: Optional[IBKRClient] = None
     try:
-        ticker, num_months, max_per_month = parse_cli_args()
-
+        ticker, num_months, max_per_month, poll_minutes, poll_interval = parse_cli_args()
         config = Config.from_env()
+        config = dataclasses.replace(config, poll_minutes=poll_minutes, poll_interval=poll_interval)
         logger = setup_logging(config)
         client = IBKRClient(config, logger)
 
-        logger.info(
-            f"Processing ticker: {ticker}, months: {num_months}, max/month: {max_per_month}"
-        )
+        logger.info(f"Processing ticker: {ticker}, months: {num_months}, max/month: {max_per_month}, poll: {poll_minutes}m/{poll_interval}s")
 
-        # 1) Resolve underlying conid and available expiry months.
+        # 1) Resolve underlying conid and available months.
         search = client.search_secdef(ticker)
         if not search.ok:
             logger.error(f"Secdef search failed: {search.error}")
             return 1
-
         under_conid = search.data.under_conid
         months = search.data.months[:num_months]
         logger.info(f"Underlying conid: {under_conid}, months: {months}")
@@ -790,15 +605,12 @@ def main() -> int:
         if not price_result.ok:
             logger.error(f"Stock price lookup failed: {price_result.error}")
             return 1
-
         stock = price_result.data
         logger.info(f"Current price for {ticker}: {stock.last}")
         append_stock_price_csv(stock, config.stock_price_csv, logger)
 
         # 3) Collect put option contracts for each month.
-        contracts = collect_contracts(
-            client, under_conid, months, stock.last, max_per_month, logger
-        )
+        contracts = collect_contracts(client, under_conid, months, stock.last, max_per_month, logger)
         if not contracts:
             logger.warning("No contracts found. Writing empty CSV (header only).")
             write_csv([], config.csv_output, logger)
@@ -817,8 +629,8 @@ def main() -> int:
 
         logger.info(f"Processing {len(top_contracts)} contracts for snapshot...")
 
-        # 5) Snapshot market fields and attach to contracts.
-        field_map = resolve_field_map("basic")
+        # 5) Snapshot market fields and attach to contracts (initial pass).
+        field_map = resolve_field_map("snapshot")
         attach_snapshot_data(client, top_contracts, field_map, logger)
 
         # 6) Correct Greek signs for puts.
@@ -834,12 +646,12 @@ def main() -> int:
         logger.info("Script completed successfully.")
         return 0
     except Exception as exc:
-        logger.critical(f"Unhandled exception in main: {exc}")
+        logging.critical(f"Unhandled exception in main: {exc}")
         return 1
     finally:
         if client is not None:
             client.close()
-            logger.info("IBKR client session closed successfully.")
+            logging.info("IBKR client session closed successfully.")
 
 
 if __name__ == "__main__":
