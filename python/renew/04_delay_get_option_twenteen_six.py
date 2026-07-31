@@ -138,7 +138,7 @@ class SecdefSearchResult:
 # Logging Setup
 # ----------------------------------------------------------------------
 def setup_logging(config: Config) -> logging.Logger:
-    logger = logging.getLogger(__name__ + str(id(config)))
+    logger = logging.getLogger(__name__)
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter(config.log_format))
@@ -149,7 +149,7 @@ def setup_logging(config: Config) -> logging.Logger:
 
 
 # ----------------------------------------------------------------------
-# Retry Decorator
+# Retry Decorator & Helper Functions
 # ----------------------------------------------------------------------
 def with_retry(max_attempts: int = 3, base_delay: float = 2.0, max_delay: float = 30.0):
     def decorator(func: Any) -> Any:
@@ -185,7 +185,8 @@ FIELD_MAP: Dict[str, str] = {
 }
 
 BASIC_FIELDS: List[str] = ["84", "85", "86", "87", "88", "89", "100", "101"]
-SNAPSHOT_FIELDS: List[str] = ["31", "84", "85", "86", "87", "89", "100", "101"]
+SNAPSHOT_FIELDS: List[str] = ["31", "84", "85", "86", "87", "89", "100", "101", "104", "106"]
+ALL_MARKET_FIELDS: List[str] = ["31", "84", "85", "86", "87", "88", "89", "100", "101", "104", "106", "900"]
 
 
 class IBKRClient:
@@ -308,76 +309,59 @@ class IBKRClient:
                 ))
         return Result.success(contracts)
 
-    def _snapshot_single_field(self, conids: List[int], field: str) -> Result:
-        if not conids:
-            return Result.success({})
-        endpoint = "/marketdata/snapshot"
-        params = {
-            "conids": ",".join(map(str, conids)),
-            "fields": field,
-            "snapshot": "0",
-            "mdType": 2,
-        }
-        for attempt in range(3):
-            try:
-                resp = self.session.get(
-                    f"{self.config.base_url}{endpoint}",
-                    params=params,
-                    verify=self.config.verify_ssl,
-                    timeout=self.config.request_timeout,
-                )
-                resp.raise_for_status()
-                return Result.success(resp.json())
-            except Exception as exc:
-                if attempt < 2:
-                    time.sleep(2 ** (attempt + 1))
-                else:
-                    return Result.failure(f"Snapshot field {field} failed: {exc}")
-        return Result.failure("Unexpected exit from snapshot retry loop")
-
-    def _snapshot_fields(self, conids: List[int], field_ids: List[str]) -> Result:
+    def _snapshot_fields(self, conids: List[int], field_ids: List[str], md_type: str = "1") -> Result:
         if not conids:
             return Result.success({})
         merged: Dict[int, Dict[str, Any]] = {cid: {"conid": cid} for cid in conids}
-        for field_id in field_ids:
-            result = self._snapshot_single_field(conids, field_id)
-            if not result.ok:
-                self.logger.warning(f"Failed to fetch field {field_id}: {result.error}")
+        fields_str = ",".join(field_ids) if isinstance(field_ids, list) else field_ids
+        params: Dict[str, Any] = {
+            "conids": ",".join(map(str, conids)),
+            "fields": fields_str,
+            "snapshot": "0",
+            "mdType": md_type,
+        }
+        try:
+            resp = self.session.get(f"{self.config.base_url}/marketdata/snapshot", params=params, verify=self.config.verify_ssl, timeout=self.config.request_timeout)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as exc:
+            return Result.failure(f"Snapshot request failed: {exc}")
+        except json.JSONDecodeError as exc:
+            return Result.failure(f"Invalid JSON response: {exc}")
+
+        items = data if isinstance(data, list) else [data]
+        for item in items:
+            if not isinstance(item, dict):
                 continue
-            items = result.data if isinstance(result.data, list) else [result.data]
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                cid = item.get("conid")
-                if cid not in merged:
-                    continue
+            cid = item.get("conid")
+            if cid not in merged:
+                continue
+            for field_id, attr_name in FIELD_MAP.items():
                 val = item.get(field_id)
-                if val is not None:
+                if val is not None and val != "":
                     try:
+                        if isinstance(val, str):
+                            if "," in val and field_id not in ["84", "85"]:
+                                val = val.replace(",", ".")
                         val = float(val)
+                        attr_name_local = FIELD_MAP.get(field_id)
+                        if attr_name_local:
+                            merged[cid][attr_name_local] = val
                     except (ValueError, TypeError):
-                        pass
-                    attr_name = FIELD_MAP.get(field_id)
-                    if attr_name and val not in (None, ""):
-                        merged[cid][attr_name] = val
+                        self.logger.debug(f"Could not convert field {field_id} value '{val}' to float")
         return Result.success(list(merged.values()))
 
     def get_stock_price(self, conid: int, symbol: str) -> Result:
-        auth = self.authenticate()
-        if not auth.ok:
-            return Result.failure(f"Auth failed: {auth.error}")
-
-        endpoint = "/marketdata/snapshot"
         params: Dict[str, Any] = {
             "conids": conid,
             "fields": "31,84,85",
             "snapshot": "0",
+            "mdType": "1",
         }
-
         for attempt in range(self.config.max_retries):
             try:
                 resp = self.session.get(
-                    f"{self.config.base_url}{endpoint}",
+                    f"{self.config.base_url}/marketdata/snapshot",
                     params=params,
                     verify=self.config.verify_ssl,
                     timeout=self.config.request_timeout,
@@ -396,12 +380,6 @@ class IBKRClient:
                     time.sleep(3)
                     continue
                 return Result.failure(f"Invalid JSON: {exc}")
-            except Exception as exc:
-                self.logger.error(f"Unexpected error: {exc}")
-                if attempt < self.config.max_retries - 1:
-                    time.sleep(3)
-                    continue
-                return Result.failure(f"Error: {exc}")
 
             item = data[0] if isinstance(data, list) and len(data) > 0 else data
             if not isinstance(item, dict):
@@ -413,23 +391,44 @@ class IBKRClient:
             last_val = item.get("31")
             if last_val is None or last_val == "":
                 self.logger.warning(f"Last price (field 31) missing, attempt {attempt + 1}/{self.config.max_retries}")
-                try:
-                    bid_val = float(item.get("84", 0))
-                    ask_val = float(item.get("85", 0))
-                    if bid_val > 0 and ask_val > 0:
-                        mid = (bid_val + ask_val) / 2.0
-                        self.logger.info(f"Using bid/ask midpoint as last: {mid}")
-                        return Result.success(StockPrice(symbol=symbol, conid=conid, last=mid, bid=bid_val, ask=ask_val))
-                except (ValueError, TypeError):
-                    pass
+                bid_val = None
+                ask_val = None
+                bid_raw = item.get("84")
+                ask_raw = item.get("85")
+                if bid_raw:
+                    try:
+                        bid_val = float(bid_raw.replace(",", "."))
+                    except (ValueError, TypeError):
+                        pass
+                if ask_raw:
+                    try:
+                        ask_val = float(ask_raw.replace(",", "."))
+                    except (ValueError, TypeError):
+                        pass
+                if bid_val and ask_val:
+                    mid = (bid_val + ask_val) / 2.0
+                    self.logger.info(f"Using bid/ask midpoint as last: {mid}")
+                    return Result.success(StockPrice(symbol=symbol, conid=conid, last=mid, bid=bid_val, ask=ask_val))
                 if attempt < self.config.max_retries - 1:
                     time.sleep(3)
                     continue
                 return Result.failure("Missing last price after all retries")
 
-            last = float(item["31"])
-            bid = float(item["84"]) if item.get("84") else None
-            ask = float(item["85"]) if item.get("85") else None
+            last = float(last_val)
+            bid = None
+            ask = None
+            bid_raw = item.get("84")
+            ask_raw = item.get("85")
+            if bid_raw:
+                try:
+                    bid = float(str(bid_raw).replace(",", "."))
+                except (ValueError, TypeError):
+                    pass
+            if ask_raw:
+                try:
+                    ask = float(str(ask_raw).replace(",", "."))
+                except (ValueError, TypeError):
+                    pass
             return Result.success(StockPrice(symbol=symbol, conid=conid, last=last, bid=bid, ask=ask))
 
         return Result.failure("Max retries exceeded in get_stock_price")
@@ -485,11 +484,11 @@ def collect_contracts(client: IBKRClient, under_conid: int, months: List[str], c
     return all_contracts
 
 
-def attach_snapshot_data(client: IBKRClient, contracts: List[OptionContract], field_ids: List[str], logger: logging.Logger) -> None:
+def attach_snapshot_data(client: IBKRClient, contracts: List[OptionContract], field_ids: List[str], logger: logging.Logger, md_type: str = "1") -> None:
     if not contracts:
         return
     conids = [c.conid for c in contracts]
-    result = client._snapshot_fields(conids, field_ids)
+    result = client._snapshot_fields(conids, field_ids, md_type)
     if not result.ok:
         logger.warning(f"Failed to attach snapshot data: {result.error}")
         return
@@ -502,15 +501,17 @@ def attach_snapshot_data(client: IBKRClient, contracts: List[OptionContract], fi
             continue
         for contract in contracts:
             if contract.conid == cid:
-                for field_id in field_ids:
+                for field_id, attr_name in FIELD_MAP.items():
                     val = item.get(field_id)
                     if val is not None:
-                        attr_name = FIELD_MAP.get(field_id)
-                        if attr_name and hasattr(contract, attr_name):
-                            try:
-                                setattr(contract, attr_name, float(val))
-                            except (ValueError, TypeError):
-                                pass
+                        try:
+                            if isinstance(val, str):
+                                val = float(val.replace(",", "."))
+                            else:
+                                val = float(val)
+                            setattr(contract, attr_name, val)
+                        except (ValueError, TypeError):
+                            pass
                 break
 
 
@@ -582,6 +583,8 @@ def parse_cli_args() -> Tuple[str, int, int, int, int]:
 # Main
 # ----------------------------------------------------------------------
 def main() -> int:
+    config: Config = None
+    client: IBKRClient = None
     try:
         ticker, num_months, max_per_month, poll_minutes, poll_interval = parse_cli_args()
         config = Config.from_env()
@@ -629,9 +632,8 @@ def main() -> int:
 
         logger.info(f"Processing {len(top_contracts)} contracts for snapshot...")
 
-        # 5) Snapshot market fields and attach to contracts (initial pass).
-        field_map = resolve_field_map("snapshot")
-        attach_snapshot_data(client, top_contracts, field_map, logger)
+        # 5) Snapshot market fields with EXPLICIT mdType=1 for live data
+        attach_snapshot_data(client, top_contracts, SNAPSHOT_FIELDS, logger, md_type="1")
 
         # 6) Correct Greek signs for puts.
         for c in top_contracts:
@@ -646,12 +648,14 @@ def main() -> int:
         logger.info("Script completed successfully.")
         return 0
     except Exception as exc:
-        logging.critical(f"Unhandled exception in main: {exc}")
+        if config and hasattr(config, 'log_level'):
+            logging.critical(f"Unhandled exception in main: {exc}")
         return 1
     finally:
         if client is not None:
             client.close()
-            logging.info("IBKR client session closed successfully.")
+            if config and hasattr(config, 'log_level'):
+                logging.info("IBKR client session closed successfully.")
 
 
 if __name__ == "__main__":
