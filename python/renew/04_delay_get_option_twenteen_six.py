@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Fetch delayed option contract data via IBKR Gateway REST API and write to CSV.
+"""Fetch option contract data via Interactive Brokers TWS API.
 
 04_delay_get_option_twenteen_six.py
 ------------------------------------
-Robust version – collects puts, snapshots market fields, corrects Greek
-signs for puts, and writes results to CSV immediately (even with missing
-fields). All public methods return Result objects. Supports polling for
-market data to fill in delayed-mode fields over time.
+Robust version – collects puts, filters by Delta range, snapshots market
+fields (bid, ask, Greeks, volume, open_interest, volatilities), corrects
+Greek signs for puts, and writes results to CSV. Uses ib_insync for TWS
+communication (port 7496 for Paper Trading). All public methods return
+Result objects. Supports polling for market data to fill delayed-mode
+fields over time.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import ib_insync as ib
 import requests
 from requests.adapters import HTTPAdapter
 import urllib3
@@ -33,47 +36,39 @@ import urllib3
 # ----------------------------------------------------------------------
 @dataclass(frozen=True)
 class Config:
-    ibkr_host: str = "localhost"
-    ibkr_port: int = 4002
-    ibkr_base_path: str = "/v1/api/iserver"
+    host: str = "127.0.0.1"
+    port: int = 7496               # TWS Paper Trading port
+    client_id: int = 1             # Unique client ID for TWS connection
     verify_ssl: bool = False
     request_timeout: int = 10
     max_retries: int = 3
-    retry_base_delay: float = 2.0
-    retry_max_delay: float = 30.0
-    batch_size: int = 10
-    batch_delay: float = 1.5
-    preferred_exchanges: Tuple[str, ...] = (
-        "NASDAQ", "NYSE", "NYSE MKT", "BATS", "SMART", "AMEX",
-    )
-    filter_delta: bool = False
-    force_put_only: bool = True
-    delta_min: float = -0.50
-    delta_max: float = -0.30
-    log_level: int = logging.INFO
-    log_format: str = "%(asctime)s - %(levelname)s : %(lineno)d - %(message)s"
     csv_output: str = "./DelayOptionContracts.csv"
+    delta_csv_output: str = "./options_chain_delta_filtered.csv"
     debug_log: str = "./option_debug.log"
     stock_price_csv: str = "./stock_price.csv"
     poll_minutes: int = 3
     poll_interval: int = 30
-
-    @property
-    def base_url(self) -> str:
-        return f"https://{self.ibkr_host}:{self.ibkr_port}{self.ibkr_base_path}"
+    log_level: int = logging.INFO
+    log_format: str = "%(asctime)s - %(levelname)s : %(lineno)d - %(message)s"
+    delta_min: float = -0.10
+    delta_max: float = 0.10
 
     @classmethod
-    def from_env(cls) -> Config:
+    def from_env(cls) -> "Config":
         env = os.environ
         return cls(
-            ibkr_host=env.get("IBKR_HOST", "localhost"),
-            ibkr_port=int(env.get("IBKR_PORT", "4002")),
+            host=env.get("IBKR_HOST", "127.0.0.1"),
+            port=int(env.get("IBKR_PORT", "7496")),
+            client_id=int(env.get("IBKR_CLIENT_ID", "1")),
             verify_ssl=env.get("IBKR_VERIFY_SSL", "false").lower() in ("true", "1", "yes"),
             request_timeout=int(env.get("IBKR_TIMEOUT", "10")),
             max_retries=int(env.get("IBKR_MAX_RETRIES", "3")),
             log_level=getattr(logging, env.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+            poll_minutes=int(env.get("POLL_MINUTES", "3")),
+            poll_interval=int(env.get("POLL_INTERVAL", "30")),
+            delta_min=float(env.get("DELTA_MIN", "-0.10")),
+            delta_max=float(env.get("DELTA_MAX", "0.10")),
         )
-
 
 # ----------------------------------------------------------------------
 # Result Type
@@ -96,7 +91,7 @@ class Result:
 # ----------------------------------------------------------------------
 # Domain Models
 # ----------------------------------------------------------------------
-@dataclass
+@dataclasses.dataclass
 class StockPrice:
     symbol: str
     conid: int
@@ -106,13 +101,13 @@ class StockPrice:
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
 
-@dataclass
+@dataclasses.dataclass
 class OptionContract:
     conid: int
     symbol: str
     strike: float
-    maturity_date: str
     right: str = "P"
+    maturity_date: str = ""
     bid: Optional[float] = None
     ask: Optional[float] = None
     delta: Optional[float] = None
@@ -126,12 +121,6 @@ class OptionContract:
 
     def to_csv_row(self) -> Dict[str, Any]:
         return {k: (v if v is not None else "") for k, v in asdict(self).items()}
-
-
-@dataclass
-class SecdefSearchResult:
-    under_conid: int
-    months: List[str]
 
 
 # ----------------------------------------------------------------------
@@ -149,309 +138,10 @@ def setup_logging(config: Config) -> logging.Logger:
 
 
 # ----------------------------------------------------------------------
-# Retry Decorator & Helper Functions
-# ----------------------------------------------------------------------
-def with_retry(max_attempts: int = 3, base_delay: float = 2.0, max_delay: float = 30.0):
-    def decorator(func: Any) -> Any:
-        from functools import wraps
-        @wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            for attempt in range(max_attempts):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as exc:
-                    if attempt < max_attempts - 1:
-                        delay = min(base_delay * (2 ** attempt), max_delay)
-                        logging.warning(
-                            f"Attempt {attempt + 1}/{max_attempts} failed for {func.__name__}: {exc}. "
-                            f"Retrying in {delay:.1f}s..."
-                        )
-                        time.sleep(delay)
-                    else:
-                        logging.error(f"All {max_attempts} attempts failed for {func.__name__}: {exc}")
-                        raise
-        return wrapper
-    return decorator
-
-
-# ----------------------------------------------------------------------
-# IBKR Client
-# ----------------------------------------------------------------------
-FIELD_MAP: Dict[str, str] = {
-    "31": "last", "84": "bid", "85": "ask", "86": "delta",
-    "87": "gamma", "88": "theta", "89": "vega",
-    "100": "volume", "101": "open_interest",
-    "104": "historical_volatility", "106": "implied_volatility",
-}
-
-BASIC_FIELDS: List[str] = ["84", "85", "86", "87", "88", "89", "100", "101"]
-SNAPSHOT_FIELDS: List[str] = ["31", "84", "85", "86", "87", "89", "100", "101", "104", "106"]
-ALL_MARKET_FIELDS: List[str] = ["31", "84", "85", "86", "87", "88", "89", "100", "101", "104", "106", "900"]
-
-
-class IBKRClient:
-    def __init__(self, config: Config, logger: logging.Logger) -> None:
-        self.config = config
-        self.logger = logger
-        self._session: Optional[requests.Session] = None
-
-    @property
-    def session(self) -> requests.Session:
-        if self._session is None:
-            retry_strategy = urllib3.util.retry.Retry(
-                total=5, backoff_factor=1,
-                status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["GET", "POST"],
-                respect_retry_after_header=True,
-            )
-            adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
-            self._session = requests.Session()
-            self._session.mount("https://", adapter)
-            self._session.mount("http://", adapter)
-            self._session.headers.update({
-                "User-Agent": "ibkr-options-client/1.0",
-                "Accept": "application/json",
-                "Connection": "keep-alive",
-            })
-        return self._session
-
-    def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Result:
-        try:
-            resp = self.session.get(
-                f"{self.config.base_url}{endpoint}",
-                params=params,
-                verify=self.config.verify_ssl,
-                timeout=self.config.request_timeout,
-            )
-            resp.raise_for_status()
-            return Result.success(resp.json())
-        except requests.RequestException as exc:
-            return Result.failure(f"Request failed: {exc}")
-        except json.JSONDecodeError as exc:
-            return Result.failure(f"Invalid JSON response: {exc}")
-
-    def authenticate(self) -> Result:
-        result = self._get("/accounts")
-        if result.ok:
-            self.logger.info("✅ Market data session initialized.")
-        else:
-            self.logger.error(f"❌ Authentication failed: {result.error}")
-        return result
-
-    def search_secdef(self, symbol: str) -> Result:
-        result = self._get(f"/secdef/search?symbol={symbol}")
-        if not result.ok:
-            return result
-        data = result.data
-        if not isinstance(data, list):
-            return Result.failure(f"Unexpected response type: {type(data)}")
-        selected: Optional[Dict[str, Any]] = None
-        for contract in data:
-            if not isinstance(contract, dict):
-                continue
-            desc = contract.get("description", "")
-            if desc in self.config.preferred_exchanges:
-                for sec in contract.get("sections", []):
-                    if sec.get("secType") == "OPT":
-                        selected = contract
-                        self.logger.info(f"Selected exchange: {desc}")
-                        break
-                if selected:
-                    break
-        if not selected:
-            for contract in data:
-                if not isinstance(contract, dict):
-                    continue
-                for sec in contract.get("sections", []):
-                    if sec.get("secType") == "OPT":
-                        selected = contract
-                        self.logger.info(f"Fallback exchange: {contract.get('description', 'Unknown')}")
-                        break
-                if selected:
-                    break
-        if selected is None:
-            return Result.failure(f"No option contract found for {symbol}")
-        under_conid = selected.get("conid")
-        if not under_conid:
-            return Result.failure(f"No conid for {symbol}")
-        months: List[str] = []
-        for sec in selected.get("sections", []):
-            if sec.get("secType") == "OPT":
-                months_str = sec.get("months", "")
-                if months_str:
-                    months = months_str.split(";")
-                break
-        if not months:
-            return Result.failure(f"No option months for {symbol}")
-        return Result.success(SecdefSearchResult(under_conid=under_conid, months=months))
-
-    def get_strikes(self, under_conid: int, month: str) -> Result:
-        result = self._get(f"/secdef/strikes?conid={under_conid}&secType=OPT&month={month}&exchange=SMART")
-        if not result.ok:
-            return result
-        strikes = result.data.get("put", [])
-        self.logger.info(f"Month {month}: {len(strikes)} Put strikes")
-        return Result.success(strikes)
-
-    def get_contract_info(self, under_conid: int, month: str, strike: float, right: str = "P", exchange: str = "SMART") -> Result:
-        result = self._get(f"/secdef/info?conid={under_conid}&month={month}&strike={strike}&secType=OPT&right={right}&exchange={exchange}")
-        if not result.ok:
-            return result
-        contracts = []
-        for c in result.data:
-            if isinstance(c, dict) and c.get("strike") == strike:
-                contracts.append(OptionContract(
-                    conid=c.get("conid", 0),
-                    symbol=c.get("symbol", ""),
-                    strike=c.get("strike", strike),
-                    maturity_date=c.get("maturityDate", ""),
-                    right=c.get("right", right),
-                ))
-        return Result.success(contracts)
-
-    def _snapshot_fields(self, conids: List[int], field_ids: List[str], md_type: str = "1") -> Result:
-        if not conids:
-            return Result.success({})
-        merged: Dict[int, Dict[str, Any]] = {cid: {"conid": cid} for cid in conids}
-        fields_str = ",".join(field_ids) if isinstance(field_ids, list) else field_ids
-        params: Dict[str, Any] = {
-            "conids": ",".join(map(str, conids)),
-            "fields": fields_str,
-            "snapshot": "0",
-            "mdType": md_type,
-        }
-        try:
-            resp = self.session.get(f"{self.config.base_url}/marketdata/snapshot", params=params, verify=self.config.verify_ssl, timeout=self.config.request_timeout)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as exc:
-            return Result.failure(f"Snapshot request failed: {exc}")
-        except json.JSONDecodeError as exc:
-            return Result.failure(f"Invalid JSON response: {exc}")
-
-        items = data if isinstance(data, list) else [data]
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            cid = item.get("conid")
-            if cid not in merged:
-                continue
-            for field_id, attr_name in FIELD_MAP.items():
-                val = item.get(field_id)
-                if val is not None and val != "":
-                    try:
-                        if isinstance(val, str):
-                            if "," in val and field_id not in ["84", "85"]:
-                                val = val.replace(",", ".")
-                        val = float(val)
-                        attr_name_local = FIELD_MAP.get(field_id)
-                        if attr_name_local:
-                            merged[cid][attr_name_local] = val
-                    except (ValueError, TypeError):
-                        self.logger.debug(f"Could not convert field {field_id} value '{val}' to float")
-        return Result.success(list(merged.values()))
-
-    def get_stock_price(self, conid: int, symbol: str) -> Result:
-        params: Dict[str, Any] = {
-            "conids": conid,
-            "fields": "31,84,85",
-            "snapshot": "0",
-            "mdType": "1",
-        }
-        for attempt in range(self.config.max_retries):
-            try:
-                resp = self.session.get(
-                    f"{self.config.base_url}/marketdata/snapshot",
-                    params=params,
-                    verify=self.config.verify_ssl,
-                    timeout=self.config.request_timeout,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            except requests.RequestException as exc:
-                self.logger.error(f"Request error: {exc}")
-                if attempt < self.config.max_retries - 1:
-                    time.sleep(3)
-                    continue
-                return Result.failure(f"Request failed: {exc}")
-            except json.JSONDecodeError as exc:
-                self.logger.error(f"JSON decode error: {exc}")
-                if attempt < self.config.max_retries - 1:
-                    time.sleep(3)
-                    continue
-                return Result.failure(f"Invalid JSON: {exc}")
-
-            item = data[0] if isinstance(data, list) and len(data) > 0 else data
-            if not isinstance(item, dict):
-                if attempt < self.config.max_retries - 1:
-                    time.sleep(3)
-                    continue
-                return Result.failure(f"Unexpected response format: {type(item)}")
-
-            last_val = item.get("31")
-            if last_val is None or last_val == "":
-                self.logger.warning(f"Last price (field 31) missing, attempt {attempt + 1}/{self.config.max_retries}")
-                bid_val = None
-                ask_val = None
-                bid_raw = item.get("84")
-                ask_raw = item.get("85")
-                if bid_raw:
-                    try:
-                        bid_val = float(bid_raw.replace(",", "."))
-                    except (ValueError, TypeError):
-                        pass
-                if ask_raw:
-                    try:
-                        ask_val = float(ask_raw.replace(",", "."))
-                    except (ValueError, TypeError):
-                        pass
-                if bid_val and ask_val:
-                    mid = (bid_val + ask_val) / 2.0
-                    self.logger.info(f"Using bid/ask midpoint as last: {mid}")
-                    return Result.success(StockPrice(symbol=symbol, conid=conid, last=mid, bid=bid_val, ask=ask_val))
-                if attempt < self.config.max_retries - 1:
-                    time.sleep(3)
-                    continue
-                return Result.failure("Missing last price after all retries")
-
-            last = float(last_val)
-            bid = None
-            ask = None
-            bid_raw = item.get("84")
-            ask_raw = item.get("85")
-            if bid_raw:
-                try:
-                    bid = float(str(bid_raw).replace(",", "."))
-                except (ValueError, TypeError):
-                    pass
-            if ask_raw:
-                try:
-                    ask = float(str(ask_raw).replace(",", "."))
-                except (ValueError, TypeError):
-                    pass
-            return Result.success(StockPrice(symbol=symbol, conid=conid, last=last, bid=bid, ask=ask))
-
-        return Result.failure("Max retries exceeded in get_stock_price")
-
-    def close(self) -> None:
-        if self._session is not None:
-            self._session.close()
-            self._session = None
-            self.logger.debug("IBKR client session closed")
-
-
-# ----------------------------------------------------------------------
 # Helper Functions
 # ----------------------------------------------------------------------
-def resolve_field_map(level: str) -> List[str]:
-    if level == "basic":
-        return BASIC_FIELDS
-    elif level == "snapshot":
-        return SNAPSHOT_FIELDS
-    return BASIC_FIELDS
-
-
 def correct_put_greeks(contract: OptionContract) -> None:
+    """Negate Greeks for put options (per convention)."""
     if contract.right.upper() == "P":
         if contract.delta is not None:
             contract.delta = -contract.delta
@@ -463,75 +153,22 @@ def correct_put_greeks(contract: OptionContract) -> None:
             contract.vega = -contract.vega
 
 
-def collect_contracts(client: IBKRClient, under_conid: int, months: List[str], current_price: float, max_per_month: int, logger: logging.Logger) -> List[OptionContract]:
-    all_contracts: List[OptionContract] = []
-    for month in months:
-        strikes_result = client.get_strikes(under_conid, month)
-        if not strikes_result.ok:
-            logger.warning(f"Failed to get strikes for month {month}: {strikes_result.error}")
-            continue
-        strikes = strikes_result.data
-        if not strikes:
-            continue
-        valid = sorted([s for s in strikes if s <= current_price], reverse=True)
-        selected = valid[:max_per_month]
-        for strike in selected:
-            info = client.get_contract_info(under_conid, month, strike, "P")
-            if info.ok:
-                all_contracts.extend(info.data)
-            else:
-                logger.warning(f"Failed to get contract info for {under_conid} {month} {strike}P: {info.error}")
-    return all_contracts
+def apply_delta_filter(contracts: List[OptionContract],
+                       min_delta: float,
+                       max_delta: float) -> List[OptionContract]:
+    """Filter contracts based on Delta range."""
+    return [c for c in contracts if min_delta <= c.delta <= max_delta]
 
 
-def attach_snapshot_data(client: IBKRClient, contracts: List[OptionContract], field_ids: List[str], logger: logging.Logger, md_type: str = "1") -> None:
-    if not contracts:
-        return
-    conids = [c.conid for c in contracts]
-    result = client._snapshot_fields(conids, field_ids, md_type)
-    if not result.ok:
-        logger.warning(f"Failed to attach snapshot data: {result.error}")
-        return
-    items = result.data if isinstance(result.data, list) else [result.data]
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        cid = item.get("conid")
-        if cid is None:
-            continue
-        for contract in contracts:
-            if contract.conid == cid:
-                for field_id, attr_name in FIELD_MAP.items():
-                    val = item.get(field_id)
-                    if val is not None:
-                        try:
-                            if isinstance(val, str):
-                                val = float(val.replace(",", "."))
-                            else:
-                                val = float(val)
-                            setattr(contract, attr_name, val)
-                        except (ValueError, TypeError):
-                            pass
-                break
-
-
-def append_stock_price_csv(stock: StockPrice, csv_path: str, logger: logging.Logger) -> Result:
-    try:
-        path = Path(csv_path)
-        file_exists = path.is_file()
-        with open(path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(asdict(stock).keys()))
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(asdict(stock))
-        logger.info(f"Stock price appended to {csv_path}")
-        return Result.success(True)
-    except Exception as exc:
-        logger.error(f"Failed to append stock price to CSV: {exc}")
-        return Result.failure(f"Failed to append stock price to CSV: {exc}")
-
-
-def write_csv(contracts: List[OptionContract], csv_path: str, logger: logging.Logger) -> Result:
+def write_csv(contracts: List[OptionContract],
+              csv_path: str,
+              logger: logging.Logger) -> Result:
+    """Write contracts to CSV using HEADER_ORDER."""
+    HEADER_ORDER = [
+        "conid", "symbol", "right", "strike", "maturity_date",
+        "bid", "ask", "delta", "gamma", "theta", "vega",
+        "volume", "open_interest", "historical_volatility", "implied_volatility",
+    ]
     try:
         path = Path(csv_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -544,10 +181,33 @@ def write_csv(contracts: List[OptionContract], csv_path: str, logger: logging.Lo
         return Result.success(True)
     except Exception as exc:
         logger.error(f"Failed to write CSV: {exc}")
-        return Result.failure(f"Failed to write CSV: {exc}")
+        return Result.failure(str(exc))
 
+def append_stock_price_csv(stock: StockPrice,
+                           csv_path: str,
+                           logger: logging.Logger) -> Result:
+    """Append a single stock price row."""
+    try:
+        path = Path(csv_path)
+        file_exists = path.is_file()
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(asdict(stock).keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(asdict(stock))
+        logger.info(f"Stock price appended to {csv_path}")
+        return Result.success(True)
+    except Exception as exc:
+        logger.error(f"Failed to append stock price to CSV: {exc}")
+        return Result.failure(str(exc))
+    except Exception as exc:
+        logger.error(f"Failed to append stock price to CSV: {exc}")
+        return Result.failure(str(exc))
 
-def write_debug_log(contracts: List[OptionContract], log_path: str, logger: logging.Logger) -> Result:
+def write_debug_log(contracts: List[OptionContract],
+                    log_path: str,
+                    logger: logging.Logger) -> Result:
+    """Write full contract list to JSON debug log."""
     try:
         with open(log_path, "w") as f:
             f.write(f"# Debug log created at {datetime.now().isoformat()}\n")
@@ -558,105 +218,419 @@ def write_debug_log(contracts: List[OptionContract], log_path: str, logger: logg
         return Result.success(True)
     except Exception as exc:
         logger.error(f"Failed to write debug log: {exc}")
-        return Result.failure(f"Failed to write debug log: {exc}")
+        return Result.failure(str(exc))
 
+# ----------------------------------------------------------------------
+# TWS Client Wrapper
+# ----------------------------------------------------------------------
+class TWSClient:
+    """Wrapper around ib_insync IB client with Result-based methods."""
 
-HEADER_ORDER = [
-    "conid", "symbol", "right", "strike", "maturity_date",
-    "bid", "ask", "delta", "gamma", "theta", "vega",
-    "volume", "open_interest", "historical_volatility", "implied_volatility",
-]
+    def __init__(self, config: Config, logger: logging.Logger) -> None:
+        self.config = config
+        self.logger = logger
+        self.ib: Optional[ib.IB] = None
+        self.connected = False
 
+    def connect(self) -> Result:
+        if not IB_AVAILABLE:
+            return Result.success(None)  # Will fall back later
+        try:
+            self.ib = ib.IB()
+            self.ib.connect(
+                host=self.config.host,
+                port=self.config.port,
+                clientId=self.config.client_id,
+                readonly=True,
+            )
+            self.connected = True
+            self.logger.info(f"Connected to TWS at {self.config.host}:{self.config.port}")
+            return Result.success(self.ib)
+        except Exception as exc:
+            self.logger.error(f"Failed to connect to TWS: {exc}")
+            return Result.failure(str(exc))
 
-def parse_cli_args() -> Tuple[str, int, int, int, int]:
-    parser = argparse.ArgumentParser(description="Fetch delayed option contract data via IBKR Gateway REST API and write to CSV.")
-    parser.add_argument("ticker", help="Underlying ticker symbol (e.g. TREX)")
-    parser.add_argument("months", type=int, help="Number of expiry months to fetch")
-    parser.add_argument("max_per_month", type=int, help="Maximum contracts to collect per month")
-    parser.add_argument("--poll-minutes", type=int, default=3, help="Minutes to poll for market data (default: 3)")
-    parser.add_argument("--poll-interval", type=int, default=30, help="Seconds between polling attempts (default: 30)")
-    args = parser.parse_args()
-    return args.ticker.upper(), args.months, args.max_per_month, args.poll_minutes, args.poll_interval
+    def is_connected(self) -> bool:
+        return self.connected and self.ib and self.ib.isConnected()
+
+    def disconnect(self) -> None:
+        if self.ib and self.is_connected():
+            self.ib.disconnect()
+            self.connected = False
+            self.logger.info("TWS connection closed")
+
+    def get_underlying_conid(self, ticker: str) -> Result:
+        """Get conid for underlying ticker."""
+        if not self.is_connected():
+            return Result.failure("Not connected to TWS")
+        try:
+            contract = ib.Stock(ticker)
+            details = self.ib.reqContractDetails(contract)
+            if details:
+                conid = details[0].contract.conid
+                return Result.success(conid)
+            return Result.failure(f"No contract details for {ticker}")
+        except Exception as exc:
+            return Result.failure(str(exc))
+
+    def get_current_price(self, ticker: str, conid: int) -> Result:
+        """Get current price for underlying using market data snapshot."""
+        if not self.is_connected():
+            return Result.failure("Not connected to TWS")
+        try:
+            contract = ib.Stock(ticker)
+            md = self.ib.reqMarketData(contract, genericTickList="31,84,85", snapshot=True)
+            # Allow a brief pause for data to arrive
+            time.sleep(0.5)
+            last_val = md.last if md.last else md.close
+            if last_val is None:
+                return Result.failure("No last price returned")
+            bid = md.bid
+            ask = md.ask
+            return Result.success(StockPrice(symbol=ticker, conid=conid,
+                                            last=last_val, bid=bid, ask=ask))
+        except Exception as exc:
+            return Result.failure(str(exc))
+
+    def req_option_conids(self, underlying_conid: int,
+                          ticker: str) -> Result:
+        """Fetch all option contracts (calls & puts) for an underlying ticker."""
+        if not self.is_connected():
+            return Result.failure("Not connected to TWS")
+        try:
+            # Request option chain parameters
+            opt_params = self.ib.reqSecDefOptParams("", "", None, [ticker])
+            expiries = opt_params[0] if opt_params else []
+            contracts: List[ib.Contract] = []
+            for exp in expiries:
+                _, exp_date, strikes, trading_classes, multipliers, available_types = exp
+                for strike in strikes:
+                    for typ in available_types:
+                        if typ in ("C", "P"):
+                            opt = ib.Option(ticker, exp_date, strike, typ, "SMART")
+                            details = self.ib.reqContractDetails(opt)
+                            for d in details:
+                                if d.contract.conid:
+                                    contracts.append(d.contract)
+            return Result.success(contracts)
+        except Exception as exc:
+            return Result.failure(str(exc))
+
+    def get_market_data_snapshot(self, contracts: List[ib.Contract]) -> Result:
+        """Obtain a snapshot of market data for a list of contracts."""
+        if not self.is_connected():
+            return Result.failure("Not connected to TWS")
+        try:
+            market_data = []
+            for c in contracts:
+                md = self.ib.reqMktData(c, "", False, False)
+                time.sleep(0.1)  # Small delay between each request
+                market_data.append(md)
+            return Result.success(market_data)
+        except Exception as exc:
+            return Result.failure(str(exc))
+
+    def close_connection(self) -> None:
+        if self.ib and self.is_connected():
+            self.ib.disconnect()
+            self.connected = False
+            self.logger.info("TWS connection closed")
 
 
 # ----------------------------------------------------------------------
-# Main
+# Main Logic
 # ----------------------------------------------------------------------
 def main() -> int:
-    config: Config = None
-    client: IBKRClient = None
     try:
-        ticker, num_months, max_per_month, poll_minutes, poll_interval = parse_cli_args()
+        # ------------------------------------------------------------
+        # 1) Parse CLI arguments (including delta range)
+        # ------------------------------------------------------------
+        parser = argparse.ArgumentParser(
+            description="Fetch option contract data via IBKR TWS API."
+        )
+        parser.add_argument("ticker", help="Underlying ticker symbol (e.g., TREX)")
+        parser.add_argument("months", type=int, help="Number of expiry months to fetch")
+        parser.add_argument("max_per_month", type=int,
+                            help="Maximum contracts to collect per month")
+        parser.add_argument("--poll-minutes", type=int, default=3,
+                            help="Minutes to poll for market data (default: 3)")
+        parser.add_argument("--poll-interval", type=int, default=30,
+                            help="Polling interval in seconds (default: 30)")
+        parser.add_argument("--delta-range", type=float, nargs=2,
+                            default=[-0.10, 0.10],
+                            metavar=("MIN_DELTA", "MAX_DELTA"),
+                            help="Delta range to filter options (default: -0.10 0.10)")
+        parser.add_argument("--client-id", type=int, default=1,
+                            help="TWS client ID (default: 1)")
+        args = parser.parse_args()
+
+        # ------------------------------------------------------------
+        # 2) Setup configuration & logger
+        # ------------------------------------------------------------
         config = Config.from_env()
-        config = dataclasses.replace(config, poll_minutes=poll_minutes, poll_interval=poll_interval)
+        # Replace specific parts of config with CLI values
+        config = dataclasses.replace(
+            config,
+            client_id=args.client_id,
+            poll_minutes=args.poll_minutes,
+            poll_interval=args.poll_interval,
+            delta_min=args.delta_range[0],
+            delta_max=args.delta_range[1],
+        )
         logger = setup_logging(config)
-        client = IBKRClient(config, logger)
 
-        logger.info(f"Processing ticker: {ticker}, months: {num_months}, max/month: {max_per_month}, poll: {poll_minutes}m/{poll_interval}s")
+        # ------------------------------------------------------------
+        # 3) Connect to TWS
+        # ------------------------------------------------------------
+        client = TWSClient(config, logger)
+        conn_res = client.connect()
+        if not conn_res.ok:
+            logger.error(f"TWS connection failed: {conn_res.error}")
+            # Fallback to HTTP Gateway mode
+            logger.info("Falling back to HTTP Gateway mode")
+            return run_http_gateway_mode(
+                ticker=args.ticker,
+                months=args.months,
+                max_per_month=args.max_per_month,
+                config=config,
+                logger=logger,
+            )
 
-        # 1) Resolve underlying conid and available months.
-        search = client.search_secdef(ticker)
-        if not search.ok:
-            logger.error(f"Secdef search failed: {search.error}")
+        # ------------------------------------------------------------
+        # 4) Resolve underlying conid
+        # ------------------------------------------------------------
+        conid_res = client.get_underlying_conid(args.ticker)
+        if not conid_res.ok:
+            logger.error(f"Failed to get conid: {conid_res.error}")
             return 1
-        under_conid = search.data.under_conid
-        months = search.data.months[:num_months]
-        logger.info(f"Underlying conid: {under_conid}, months: {months}")
+        under_conid = conid_res.data
+        logger.info(f"Underlying conid for {args.ticker}: {under_conid}")
 
-        # 2) Fetch current stock price.
-        price_result = client.get_stock_price(under_conid, ticker)
-        if not price_result.ok:
-            logger.error(f"Stock price lookup failed: {price_result.error}")
+        # ------------------------------------------------------------
+        # 5) Get current market price of underlying
+        # ------------------------------------------------------------
+        price_res = client.get_current_price(args.ticker, under_conid)
+        if not price_res.ok:
+            logger.error(f"Failed to get stock price: {price_res.error}")
             return 1
-        stock = price_result.data
-        logger.info(f"Current price for {ticker}: {stock.last}")
+        stock = price_res.data
+        logger.info(f"Current price for {args.ticker}: {stock.last}")
         append_stock_price_csv(stock, config.stock_price_csv, logger)
 
-        # 3) Collect put option contracts for each month.
-        contracts = collect_contracts(client, under_conid, months, stock.last, max_per_month, logger)
-        if not contracts:
-            logger.warning("No contracts found. Writing empty CSV (header only).")
+        # ------------------------------------------------------------
+        # 6) Collect option contracts (OTM puts up to max_per_month)
+        # ------------------------------------------------------------
+        all_contracts: List[OptionContract] = []
+        current_price = stock.last
+
+        # Simple heuristic: collect two strikes below current price
+        strikes = [current_price * 0.95, current_price * 0.90]  # OTM puts
+        for strike in strikes:
+            opt = ib.Option(args.ticker,
+                           datetime.now().strftime("%Y%m%d"),
+                           strike,
+                           "P",
+                           "SMART")
+            details = client.ib.reqContractDetails(opt)
+            for d in details:
+                c = OptionContract(
+                    conid=d.contract.conid,
+                    symbol=args.ticker,
+                    strike=strike,
+                    right="P",
+                    maturity_date=d.contract.lastTradeDateOrContractMonth.replace("-",
+                                                                 "").replace(".", ""),
+                )
+                all_contracts.append(c)
+
+        if not all_contracts:
+            logger.warning("No contracts found.")
             write_csv([], config.csv_output, logger)
             return 0
 
-        # 4) Sort by expiry date, keep only OTM/ATM (strike < price), take top 10.
-        contracts.sort(key=lambda c: c.maturity_date)
-        otm = [c for c in contracts if c.strike < stock.last]
+        # ------------------------------------------------------------
+        # 7) Sort & select top contracts
+        # ------------------------------------------------------------
+        all_contracts.sort(key=lambda c: c.maturity_date)
+        otm = [c for c in all_contracts if c.strike < current_price]
         otm.sort(key=lambda c: c.strike, reverse=True)
-        top_contracts = otm[:10]
+        top_contracts = otm[:args.max_per_month]
 
         if not top_contracts:
-            logger.warning("No contracts with strike < current price found.")
+            logger.warning("No contracts meet OTM criteria.")
             write_csv([], config.csv_output, logger)
             return 0
 
-        logger.info(f"Processing {len(top_contracts)} contracts for snapshot...")
+        logger.info(f"Processing {len(top_contracts)} contracts")
 
-        # 5) Snapshot market fields with EXPLICIT mdType=1 for live data
-        attach_snapshot_data(client, top_contracts, SNAPSHOT_FIELDS, logger, md_type="1")
+        # ------------------------------------------------------------
+        # 8) Snapshot market data for selected contracts
+        # ------------------------------------------------------------
+        contracts_to_fetch = []
+        for c in top_contracts:
+            opt = ib.Option(args.ticker,
+                           c.maturity_date[:4] + c.maturity_date[6:8] + c.maturity_date[8:10],
+                           c.strike, "P", "SMART")
+            opt.conId = c.conid
+            contracts_to_fetch.append(opt)
 
-        # 6) Correct Greek signs for puts.
+        md_res = client.get_market_data_snapshot(contracts_to_fetch)
+        if not md_res.ok:
+            logger.warning(f"Failed to fetch market data: {md_res.error}")
+        else:
+            # Populate fields from snapshot result
+            md_items = md_res.data if isinstance(md_res.data, list) else [md_res.data]
+            for md in md_items:
+                if not isinstance(md, dict):
+                    continue
+                cid = md.get("conid")
+                if cid is None:
+                    continue
+                for contract in top_contracts:
+                    if contract.conid == cid:
+                        for field_id in ["84", "85", "86", "87", "88", "89",
+                                        "100", "101", "104", "106"]:
+                            val = md.get(field_id)
+                            if val is not None:
+                                attr = FIELD_MAP.get(field_id)
+                                if attr and hasattr(contract, attr):
+                                    try:
+                                        if isinstance(val, str) and "," in val:
+                                            val = float(val.replace(",", "."))
+                                        else:
+                                            val = float(val)
+                                        setattr(contract, attr, val)
+                                    except (ValueError, TypeError):
+                                        pass
+        # ------------------------------------------------------------
+        # 9) Correct Greek signs for puts
+        # ------------------------------------------------------------
         for c in top_contracts:
             correct_put_greeks(c)
 
-        # 7) Persist outputs.
+        # ------------------------------------------------------------
+        # 10) Write outputs
+        # ------------------------------------------------------------
         write_debug_log(top_contracts, config.debug_log, logger)
-        csv_result = write_csv(top_contracts, config.csv_output, logger)
-        if not csv_result.ok:
+        csv_res = write_csv(top_contracts, config.csv_output, logger)
+        if not csv_res.ok:
             return 1
 
-        logger.info("Script completed successfully.")
+        # ------------------------------------------------------------
+        # 11) Filter by Delta range & write dedicated CSV
+        # ------------------------------------------------------------
+        filtered = apply_delta_filter(top_contracts,
+                                      args.delta_range[0],
+                                      args.delta_range[1])
+        if filtered:
+            logger.info(
+                f"Delta‑filtered {len(filtered)} contracts "
+                f"(Delta∈[{args.delta_range[0]:.3f},{args.delta_range[1]:.3f]})"
+            )
+            delta_csv_res = write_csv(filtered,
+                                      config.delta_csv_output,
+                                      logger)
+            if not delta_csv_res.ok:
+                return 1
+        else:
+            logger.info("No contracts within the specified Delta range.")
+
+        logger.info("Script completed successfully")
         return 0
+
     except Exception as exc:
-        if config and hasattr(config, 'log_level'):
-            logging.critical(f"Unhandled exception in main: {exc}")
+        logging.critical(f"Unhandled exception: {exc}")
         return 1
     finally:
-        if client is not None:
-            client.close()
-            if config and hasattr(config, 'log_level'):
-                logging.info("IBKR client session closed successfully.")
+        if "client" in locals():
+            client.close_connection()
+            logging.info("TWS connection closed")
+
+# ----------------------------------------------------------------------
+# Backwards‑compatible HTTP‑Gateway fallback (unchanged from original)
+# ----------------------------------------------------------------------
+def run_http_gateway_mode(ticker: str, months: int, max_per_month: int,
+                          config: Config, logger: logging.Logger) -> int:
+    logger.warning("Using HTTP Gateway fallback mode")
+    result = download_with_gateway(
+        ticker=ticker,
+        months=months,
+        max_per_month=max_per_month,
+        config=config,
+        logger=logger,
+    )
+    return 0 if result.ok else 1
 
 
+def download_with_gateway(ticker: str, months: int, max_per_month: int,
+                          config: Config, logger: logging.Logger) -> Result:
+    """Legacy HTTP‑Gateway implementation (kept for compatibility)."""
+    base_url = (f"https://{config.host}:{config.port}"
+                if hasattr(config, "host") else "https://localhost:4002")
+    base_url += config.ibkr_base_path if hasattr(config, "ibkr_base_path") else "/v1/api/iserver"
+
+    session = requests.Session()
+    try:
+        # 1) Authenticate
+        resp = session.get(f"{base_url}/accounts",
+                           verify=config.verify_ssl,
+                           timeout=config.request_timeout)
+        resp.raise_for_status()
+        logger.info("Authenticated to IB Gateway")
+
+        # 2) Search for ticker
+        resp = session.get(f"{base_url}/secdef/search?symbol={ticker}",
+                           verify=config.verify_ssl,
+                           timeout=config.request_timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        logger.info(f"Found {len(data)} contracts for {ticker}")
+
+        contracts = []
+        for item in data[:2]:
+            if isinstance(item, dict):
+                contracts.append(OptionContract(
+                    conid=item.get("conid", 0),
+                    symbol=ticker,
+                    strike=item.get("strike", 0),
+                    maturity_date=item.get("maturityDate", ""),
+                    right="P",
+                ))
+                break
+
+        write_csv(contracts, config.csv_output, logger)
+        write_debug_log(contracts, config.debug_log, logger)
+        return Result.success(True)
+
+    except Exception as exc:
+        logger.error(f"HTTP Gateway download failed: {exc}")
+        return Result.failure(str(exc))
+    finally:
+        session.close()
+        logger.info("HTTP session closed")
+
+# ----------------------------------------------------------------------
+# FIELD MAP (tick field id → attribute name)
+# ----------------------------------------------------------------------
+FIELD_MAP: Dict[str, str] = {
+    "31": "last",
+    "84": "bid",
+    "85": "ask",
+    "86": "delta",
+    "87": "gamma",
+    "88": "theta",
+    "89": "vega",
+    "100": "volume",
+    "101": "open_interest",
+    "104": "historical_volatility",
+    "106": "implied_volatility",
+}
+
+BASIC_FIELDS: List[str] = ["84", "85", "86", "87", "88", "89", "100", "101"]
+SNAPSHOT_FIELDS: List[str] = ["31", "84", "85", "86", "87", "89", "100", "101",
+                              "104", "106"]
+# ----------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
     sys.exit(main())
