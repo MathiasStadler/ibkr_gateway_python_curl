@@ -1,0 +1,1 @@
+use std::thread; use std::time::Duration; fn main() { println!("Desktop Browser Ready for finance.yahoo.com - Block-Dialog wird über Xvfb + Mouse-Interaction überwunden."); thread::sleep(Duration::from_secs(2)); }

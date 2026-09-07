@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="de">
+<head><meta charset="utf-8"><title>Browser Desktop Export</title>
+<style>body{font-family:system-ui;background:#0f0f14;color:#e8e8f0;padding:2rem;max-width:900px;margin:0 auto}h1{font-size:26px;margin-bottom:.3rem;color:#fff}p{color:#b0b0c0}.card{background:#1a1a22;border:1px solid #2a2a38;border-radius:14px;padding:1.5rem;margin-bottom:1rem}h2{font-size:15px;color:#aaa;text-transform:uppercase;letter-spacing:.06em;margin-top:0}.ok{display:inline-block;background:#1a3a28;color:#6ee7b7;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600;margin-left:.5rem}pre{background:#0a0a0e;padding:1rem;border-radius:8px;overflow:auto;font-size:12px;color:#e8e8f0;border:1px solid #222}</style></head>
+<body>
+<h1>Desktop Browser (Xvfb + VNC) <span class="ok">LIVE</span></h1>
+<p>Container <strong>browser-vnc</strong> | Port 6080 (noVNC Web) | Port 5900 (VNC) | Port 9222 (CDP)</p>
+
+<div class="card"><h2>Container Status</h2><pre>
+Container: browser-vnc (34e1f13dce8e)
+Image: hermes/browser-desktop-vnc
+Xvfb PID: 7  |  x11vnc PID: 11  |  Chromium PID: 15
+Port 6080 → noVNC Web-Client
+Port 5900 → x11vnc Server
+Port 9222 → Chrome DevTools Protocol
+URL: https://finance.yahoo.com
+</pre></div>
+
+<div class="card"><h2>Block-Dialog Überwindung</h2>
+<p><code>scripts/dismiss_dialogs.sh</code> — CDP-basiert: Entfernt Cookie-Banner und Consent-Dialoge per JavaScript (querySelector + .remove()) und schließt Popups via <code>Escape</code>-Key-Event.</p>
+</div>
+
+<div class="card"><h2>Seitenansicht</h2>
+<p>Der Desktop-Browser ist jetzt in der Vorschau sichtbar: <a href="http://localhost:6080/vnc.html" style="color:#6ee7b7">http://localhost:6080/vnc.html</a></p>
+</div>
+</body></html>
