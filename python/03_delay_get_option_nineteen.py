@@ -407,7 +407,6 @@ if __name__ == "__main__":
     if stock_info:
         current_stock_price = stock_info['last']
         print(f"{ticker} aktueller Kurs: {current_stock_price}")
-        exit
         save_stock_price_to_csv(stock_info)
         logging.info(f"ticker {ticker} akt price (stock_info)")
     else:
