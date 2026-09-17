@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Prüfen, ob jq installiert ist
-if ! command -v jq &> /dev/null; then
-    echo "Fehler: 'jq' ist nicht installiert. Bitte installiere es (z.B. 'apt install jq' oder 'brew install jq')."
-    exit 1
-fi
+# if ! command -v jq &> /dev/null; then
+#     echo "Fehler: 'jq' ist nicht installiert. Bitte installiere es (z.B. 'apt install jq' oder 'brew install jq')."
+#    exit 1
+# fi
 
 # Prüfen, ob ein Ticker als Argument übergeben wurde
 if [ -z "$1" ]; then
@@ -52,7 +52,7 @@ echo "Gefundene conid: $CONID"
 echo "Rufe Marktdaten ab..."
 
 # Erster Aufruf (aktiviert den Stream)
-curl -s "$GATEWAY_URL/iserver/marketdata/snapshot?conids=$CONID&fields=31,70,71,87" -k > /dev/null
+# curl -s "$GATEWAY_URL/iserver/marketdata/snapshot?conids=$CONID&fields=31,70,71,87" -k > /dev/null
 
 # Kurze Pause, damit der Stream bereit ist
 sleep 0.5

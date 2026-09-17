@@ -100,7 +100,7 @@ class StockPrice:
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
 @dataclass
-cls OptionContract:
+class OptionContract:
     conid: int
     symbol: str
     strike: float
@@ -121,7 +121,7 @@ cls OptionContract:
         return {k: (v if v is not None else "") for k, v in asdict(self).items()}
 
 @dataclass
-cls SecdefSearchResult:
+class SecdefSearchResult:
     under_conid: int
     months: List[str]
 
