@@ -1,0 +1,1 @@
+python ~/ibkr_gateway_python_curl/python/save_old/03_delay_get_option_fourteen.py CROX 2
