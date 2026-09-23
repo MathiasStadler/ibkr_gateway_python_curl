@@ -148,7 +148,7 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
         conid_str = ",".join(str(c) for c in batch)
         url = f'https://localhost:4002/v1/api/iserver/marketdata/snapshot?conids={conid_str}&fields={fields}&genericTickList={generic_ticks}&delay=1&snapshot=1'
 
-        logging,info( f"url => {url}"
+        logging.info( f"url => {url}" )
         batch_data = {}
         for attempt in range(max_attempts):
             try:
@@ -170,6 +170,7 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
                         if val is not None:
                             batch_data[conid][f_name] = val
                         else:
+                            logging.info(f"ERROR ({conid}) => value for field {f_name} is None")                
                             batch_data[conid][f_name] = ""
                     
                     # Generische Ticks verarbeiten (Volume, Open Interest, Volatilitäten)
@@ -182,6 +183,7 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
                 
                 complete = sum(1 for c in batch_data if all(f in batch_data[c] for f in field_map.values()))
                 logging.info(f"Batch {batch_num}, attempt {attempt+1}: {complete}/{len(batch)} complete")
+                logging.info(f"complete {complete} = {len(batch)}")
                 if complete == len(batch):
                     break
                 if attempt < max_attempts-1:
