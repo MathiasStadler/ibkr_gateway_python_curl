@@ -11,7 +11,7 @@ import time
 import logging
 from datetime import datetime
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(lineno)d - %(message)s')
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PREFERRED_EXCHANGES = ["NASDAQ", "NYSE", "NYSE MKT", "BATS", "SMART", "AMEX"]
@@ -110,7 +110,7 @@ def secdefInfo(conid, month, strike, right="P", exchange="SMART"):
         contracts.append(contractDetails)
     return contracts
 
-def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="100,101,104,106", max_attempts=2, delay=2, batch_size=10):
+def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="100,101,104,106", max_attempts=3, delay=2, batch_size=10):
     """
     Abruf von Marktdaten: 
     - fields: Bid (84), Ask (85), Delta (86), Gamma (87), Theta (88), Vega (89)
@@ -156,6 +156,8 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
                 resp.raise_for_status()
                 data = resp.json()
                 
+                logging.info(f"Data =>  {data}")
+                logging.info(f"--END --")
                 for item in data:
                     conid = item.get("conid")
                     if not conid:
@@ -170,8 +172,8 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
                         if val is not None:
                             batch_data[conid][f_name] = val
                         else:
-                            logging.info(f"ERROR ({conid}) => value for field {f_name} is None")                
-                            batch_data[conid][f_name] = ""
+                            logging.info(f"ERROR ({conid}) => value for field {f_name} is None")               
+                            batch_data[conid][f_name] = "n/a"
                     
                     # Generische Ticks verarbeiten (Volume, Open Interest, Volatilitäten)
                     for g_id, g_name in generic_map.items():
@@ -179,11 +181,18 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
                         if val is not None:
                             batch_data[conid][g_name] = val
                         else:
-                            batch_data[conid][g_name] = ""
+                            batch_data[conid][g_name] = "n/a"
                 
-                complete = sum(1 for c in batch_data if all(f in batch_data[c] for f in field_map.values()))
+                all_fields = list(field_map.values()) + list(generic_map.values())
+                logging.info(f"Batch {batch_num}, attempt {attempt+1}: {len(batch_data)} contracts fetched")
+                complete = sum(1 for c in batch_data if all(batch_data[c].get(f) not in ["", None, "n/a"] for f in all_fields))
+
+                logging.info(f"Batch {batch_num}, attempt {attempt+1}: {complete}/{len(batch)} complete")
+
                 logging.info(f"Batch {batch_num}, attempt {attempt+1}: {complete}/{len(batch)} complete")
                 logging.info(f"complete {complete} = {len(batch)}")
+                if attempt == max_attempts - 1:
+                    complete = False
                 if complete == len(batch):
                     break
                 if attempt < max_attempts-1:
@@ -199,15 +208,15 @@ def get_option_snapshot_bulk(conids, fields="84,85,86,87,88,89", generic_ticks="
         for conid, quote in batch_data.items():
             formatted = {}
             for f_name in field_map.values():
-                val = quote.get(f_name, "")
+                val = quote.get(f_name, "n/a")
                 if f_name in ["bid", "ask"]:
-                    formatted[f_name] = str(val) if val not in ["", None] else ""
+                    formatted[f_name] = str(val) if val not in ["", None] else "n/a"
                 else:
-                    formatted[f_name] = val if val not in ["", None] else ""
+                    formatted[f_name] = val if val not in ["", None] else "n/a"
             
             # Generische Felder hinzufügen
             for g_name in generic_map.values():
-                formatted[g_name] = quote.get(g_name, "")
+                formatted[g_name] = quote.get(g_name, "n/a")
             
             all_data[conid] = formatted
         
