@@ -1,3 +1,0 @@
-conid,symbol,expiry,strike,right,exchange,last,bid,ask,delta,gamma,theta,vega,volume,open_interest,implied_volatility
-912499816,CROX,20261016,125.0,P,SMART,,5.9,6.5,0.5347,-0.0314,0.1103,-0.1215,,,
-912498094,CROX,20261016,125.0,C,SMART,4.15,4.1,4.7,0.4705,0.0311,-0.1239,0.1217,,,
