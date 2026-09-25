@@ -1,1 +1,13 @@
 python ~/ibkr_gateway_python_curl/python/save_old/03_delay_get_option_fourteen.py CROX 2
+
+
+/home/hermes/ibkr_gateway_python_curl/python/save_old/03_delay_get_option.py
+
+
+/home/hermes/ibkr_gateway_python_curl/python/save_old/03_delay_get_option_twelve.py
+conid,symbol,right,month,strike,maturityDate,bid,ask,delta,gamma,theta,vega
+912500874,CROX,P,OCT26,75.0,20261016,,59,-0.3,,,
+912499509,CROX,P,OCT26,105.0,20261016,0.20,892,-0.5,-1.0,616,
+
+#############
+
