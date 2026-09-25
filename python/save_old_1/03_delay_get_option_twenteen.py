@@ -470,7 +470,7 @@ if __name__ == "__main__":
             contracts = contracts_all[0]
             # ATTENTION contract of month with possibly weekly
             for c in contracts:
-                c["month"] = month
+                # c[month] = month
                 all_contracts.append(c)
                 conids=c["conid"]
 
