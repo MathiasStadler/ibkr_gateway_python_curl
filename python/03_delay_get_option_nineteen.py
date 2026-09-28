@@ -350,7 +350,7 @@ def writeResult(contracts_list):
     headers = ["conid", "symbol", "right", "month", "strike", "maturityDate",
                "bid", "ask", "delta", "gamma", "theta", "vega",
                "volume", "open_interest", "historical_volatility", "implied_volatility"]
-    filePath = "./DelayOptionContracts.csv"
+    filePath = "./DelayOptionContracts.csv" 
     with open(filePath, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
