@@ -45,6 +45,7 @@ def get_stock_price(conid, symbol):
         "conids": conid,
         "fields": "31,84,86"   # 31 = last, 84 = bid, 86 = ask
     }
+    # **TODO** if n/a repeat the request)
     try:
         resp = requests.get(url, params=params, verify=False)
         resp.raise_for_status()
