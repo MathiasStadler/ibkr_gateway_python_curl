@@ -27,7 +27,7 @@ except ImportError:
 # ------------------------------------------------------------
 HOST = "127.0.0.1"
 # PORT = 4002
-PORT = 7496
+PORT = 4976
 CLIENT_ID = 99
 CSV_OUTPUT = "./options.csv"
 DEBUG_LOG = "./option_debug.log"
